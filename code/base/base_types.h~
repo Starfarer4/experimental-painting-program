@@ -1,0 +1,281 @@
+#if !defined(BASE_TYPES_H)
+/*  =======================================================================
+    File: base_types.h
+    Date: March 5th 2024 10:57 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+#define BASE_TYPES_H
+
+#include <stdint.h>
+#include <stdarg.h>
+#include <math.h>
+
+#define internal static
+#define local_persist static
+#define global_variable static
+
+#define MemoryCopy memcpy
+#define MemoryMove memmove
+#define MemorySet memset
+
+#define MemoryZero(Ptr, Size) MemorySet((Ptr), 0, (Size))
+
+#define CheckNil(nil,p) ((p) == 0 || (p) == nil)
+#define SetNil(nil,p) ((p) = nil)
+
+// Doubly linked list helper macros
+#define DLLInsert_NPZ(nil,f,l,p,n,Next,Prev) (CheckNil(nil,f) ?         \
+                                              ((f) = (l) = (n), SetNil(nil,(n)->Next), SetNil(nil,(n)->Prev)) : \
+                                              CheckNil(nil,p) ?         \
+                                              ((n)->Next = (f), (f)->Prev = (n), (f) = (n), SetNil(nil,(n)->Prev)) : \
+                                              ((p)==(l)) ?              \
+                                              ((l)->Next = (n), (n)->Prev = (l), (l) = (n), SetNil(nil, (n)->Next)) : \
+                                              (((!CheckNil(nil,p) && CheckNil(nil,(p)->Next)) ? (0) : ((p)->Next->Prev = (n))), ((n)->Next = (p)->Next), ((p)->Next = (n)), ((n)->Prev = (p))))
+#define DLLPushBack_NPZ(nil,f,l,n,Next,Prev) DLLInsert_NPZ(nil,f,l,l,n,Next,Prev)
+#define DLLPushFront_NPZ(nil,f,l,n,Next,Prev) DLLInsert_NPZ(nil,l,f,f,n,Prev,Next)
+#define DLLRemove_NPZ(nil,f,l,n,Next,Prev) (((n) == (f) ? (f) = (n)->Next : (0)), \
+                                            ((n) == (l) ? (l) = (l)->Prev : (0)), \
+                                            (CheckNil(nil,(n)->Prev) ? (0) : \
+                                             ((n)->Prev->Next = (n)->Next)), \
+                                            (CheckNil(nil,(n)->Next) ? (0) : \
+                                             ((n)->Next->Prev = (n)->Prev)))
+
+#define DLLInsert_NP(f,l,p,n,Next,Prev) DLLInsert_NPZ(0,f,l,p,n,Next,Prev)
+#define DLLPushBack_NP(f,l,n,Next,Prev) DLLPushBack_NPZ(0,f,l,n,Next,Prev)
+#define DLLPushFront_NP(f,l,n,Next,Prev) DLLPushFront_NPZ(0,f,l,n,Next,Prev)
+#define DLLRemove_NP(f,l,n,Next,Prev) DLLRemove_NPZ(0,f,l,n,Next,Prev)
+#define DLLInsert(f,l,p,n) DLLInsert_NPZ(0,f,l,p,n,Next,Prev)
+#define DLLPushBack(f,l,n) DLLPushBack_NPZ(0,f,l,n,Next,Prev)
+#define DLLPushFront(f,l,n) DLLPushFront_NPZ(0,f,l,n,Next,Prev)
+#define DLLRemove(f,l,n) DLLRemove_NPZ(0,f,l,n,Next,Prev)
+
+// Singly linked list helper macros
+#define SLLQueuePush_NZ(nil,f,l,n,Next) (CheckNil(nil,f)?               \
+                                         ((f)=(l)=(n),SetNil(nil,(n)->Next)): \
+                                         ((l)->Next=(n),(l)=(n),SetNil(nil,(n)->Next)))
+#define SLLQueuePushFront_NZ(nil,f,l,n,Next) (CheckNil(nil,f)?          \
+                                              ((f)=(l)=(n),SetNil(nil,(n)->Next)): \
+                                              ((n)->Next=(f),(f)=(n)))
+#define SLLQueuePop_NZ(nil,f,l,Next) ((f)==(l)?                         \
+                                      (SetNil(nil,f),SetNil(nil,l)):    \
+                                      ((f)=(f)->Next))
+
+#define SLLStackPush_N(f,n,Next) ((n)->Next=(f), (f)=(n))
+#define SLLStackPop_N(f,Next) ((f)=(f)->Next)
+
+#define SLLQueuePush_N(f,l,n,Next) SLLQueuePush_NZ(0,f,l,n,Next)
+#define SLLQueuePushFront_N(f,l,n,Next) SLLQueuePushFront_NZ(0,f,l,n,Next)
+#define SLLQueuePop_N(f,l,Next) SLLQueuePop_NZ(0,f,l,Next)
+#define SLLQueuePush(f,l,n) SLLQueuePush_NZ(0,f,l,n,Next)
+#define SLLQueuePushFront(f,l,n) SLLQueuePushFront_NZ(0,f,l,n,Next)
+#define SLLQueuePop(f,l) SLLQueuePop_NZ(0,f,l,Next)
+
+#define SLLStackPush(f,n) SLLStackPush_N(f,n,Next)
+#define SLLStackPop(f) SLLStackPop_N(f,Next)
+
+#define DeferLoop(begin, end) for(int _i_ = ((begin), 0); !_i_; ++_i_, (end))
+#define DeferLoopChecked(begin, end) for(int _i_ = 2 * !(begin); (_i_ == 2 ? ((end), 0) : !_i_); ++_i_, (end))
+
+#define Bytes(n)      (n)
+#define Kilobytes(n)  (n << 10)
+#define Megabytes(n)  (n << 20)
+#define Gigabytes(n)  (((U64)n) << 30)
+#define Terabytes(n)  (((U64)n) << 40)
+#define Thousand(n) ((n) * 1000)
+#define Million(n) ((n) * 1000000)
+#define Billion(n) ((n) * 1000000000)
+
+#define Min(a, b) (((a)<(b)) ? (a) : (b))
+#define Max(a, b) (((a)>(b)) ? (a) : (b))
+#define ClampTop(x, a) Min(x,a)
+#define ClampBot(a, x) Max(a,x)
+#define Clamp(a, x, b) (((a)>(x))?(a):((b)<(x))?(b):(x))
+#define Trunc(x) ((F32)(I32)(x))
+
+#define per_thread __declspec(thread)
+
+typedef int8_t I8;
+typedef int16_t I16;
+typedef int32_t I32;
+typedef int64_t I64;
+
+typedef uint8_t U8;
+typedef uint16_t U16;
+typedef uint32_t U32;
+typedef uint64_t U64;
+
+typedef I8 B8;
+typedef I16 B16;
+typedef I32 B32;
+typedef I64 B64;
+
+typedef float F32;
+typedef double F64;
+
+#define ArrayCount(Arr) (sizeof(Arr) / sizeof((Arr)[0]))
+#define IntFromPtr(Ptr) (U64)(((U8 *)Ptr) - 0)
+#define PtrFromInt(Int) (void *)(((U8 *)0) + Int)
+#define Member(Type, MemberName) ((Type *)0)->MemberName
+#define OffsetOf(Type, MemberName) IntFromPtr(&Member(Type, MemberName))
+
+#if PX_PLATFORM_WINDOWS
+#define BreakDebugger() __debugbreak()
+#else
+#define BreakDebugger() (*(volatile int *)0 = 0)
+#endif
+
+#undef Assert
+#define Assert(Expr) do{ if(!(Expr)) {BreakDebugger();}} while(0)
+
+const global_variable U8 U8Max = 0xFF;
+const global_variable U8 U8Min = 0;
+
+const global_variable U16 U16Max = 0xFFFF;
+const global_variable U16 U16Min = 0;
+
+const global_variable U32 U32Max = 0xFFFFFFFF;
+const global_variable U32 U32Min = 0;
+
+const global_variable U64 U64Max = 0xFFFFFFFFFFFFFFFF;
+const global_variable U64 U64Min = 0;
+
+const global_variable I8 I8Max = 0x7F;
+const global_variable I8 I8Min = -1 - 0x7F;
+
+const global_variable I16 I16Max = 0x7FFF;
+const global_variable I16 I16Min = -1 - 0x7FFF;
+
+const global_variable I32 I32Max = 0x7FFFFFFF;
+const global_variable I32 I32Min = -1 - 0x7FFFFFFF;
+
+const global_variable I64 I64Max = 0x7FFFFFFFFFFFFFFF;
+const global_variable I64 I64Min = -1 - 0x7FFFFFFFFFFFFFFF;
+
+const global_variable U32 SignF32 = 0x80000000;
+const global_variable U32 ExponentF32 = 0x7F800000;
+const global_variable U32 MantissaF32 = 0x7FFFFF;
+
+const global_variable F32 F32Max = 3.4028234664e+38f;
+const global_variable F32 F32Min = -3.4028234664e+38f;
+const global_variable F32 F32SmallestPositive = 1.1754943508e-38f;
+const global_variable F32 F32Epsilon = 5.96046448e-8f;
+
+const global_variable U64 SignF64 = 0x8000000000000000ull;
+const global_variable U64 ExponentF64 = 0x7FF0000000000000ull;
+const global_variable U64 MantissaF64 = 0xFFFFFFFFFFFFFull;
+
+internal U8 ReadLE8(U8 **Bytes)
+{
+    U8 Result = **Bytes;
+    *Bytes += 1;
+    return Result;
+}
+
+internal U16 ReadLE16(U8 **Bytes)
+{
+    U8 *Ptr = *Bytes;
+    U16 Value = (Ptr[1] << 8) | Ptr[0];
+    *Bytes += 2;
+    return Value;
+}
+
+internal U32 ReadLE32(U8 **Bytes)
+{
+    U8 *Ptr = *Bytes;
+    U32 Value = (Ptr[3] << 24) | (Ptr[2] << 16) | (Ptr[1] << 8) | Ptr[0];
+    *Bytes += 4;
+    return Value;
+}
+
+internal U64 ReadLE64(U8 **Bytes)
+{
+    U8 *Ptr = *Bytes;
+    U64 Value = ((U64)Ptr[7] << 56) |
+        ((U64)Ptr[6] << 48) |
+        ((U64)Ptr[5] << 40) |
+        ((U64)Ptr[4] << 32) |
+        ((U64)Ptr[3] << 24) |
+        ((U64)Ptr[2] << 16) |
+        ((U64)Ptr[1] << 8)  |
+        (U64)Ptr[0];
+    *Bytes += 8;
+    return Value;
+}
+
+internal U8 ReadBE8(U8 **Bytes)
+{
+    U8 Result = **Bytes;
+    *Bytes += 1;
+    return Result;
+}
+
+internal U16 ReadBE16(U8 **Bytes)
+{
+    U8 *Ptr = *Bytes;
+    U16 Value = (Ptr[0] << 8) | Ptr[1];
+    *Bytes += 2;
+    return Value;
+}
+
+internal U32 ReadBE32(U8 **Bytes)
+{
+    U8 *Ptr = *Bytes;
+    U32 Value = (Ptr[0] << 24) | (Ptr[1] << 16) | (Ptr[2] << 8) | Ptr[3];
+    *Bytes += 4;
+    return Value;
+}
+
+internal U64 ReadBE64(U8 **Bytes)
+{
+    U8 *Ptr = *Bytes;
+    U64 Value = ((U64)Ptr[0] << 56) |
+        ((U64)Ptr[1] << 48) |
+        ((U64)Ptr[2] << 40) |
+        ((U64)Ptr[3] << 32) |
+        ((U64)Ptr[4] << 24) |
+        ((U64)Ptr[5] << 16) |
+        ((U64)Ptr[6] << 8)  |
+        (U64)Ptr[7];
+    *Bytes += 8;
+    return Value;
+}
+
+// NOTE: Implements the FNV-1a hashing algorithm http://isthe.com/chongo/tech/comp/fnv/
+internal U64 HashData(U8 *Bytes, U64 Size)
+{
+    const U64 FNVPrime = 1099511628211;
+    U64 Hash = 14695981039346656037ul;
+    for(;Size--; ++Bytes)
+    {
+        Hash ^= *Bytes;
+        Hash *= FNVPrime;
+    }
+    return Hash;
+}
+
+#define HashStruct(Struct) HashData((U8 *)(Struct), sizeof(*(Struct)))
+#define HashString(String) HashData((U8 *)(String), sizeof(String) - 1)
+
+internal U16 SafeCastU16(U32 Var)
+{
+    Assert(Var <= U16Max);
+    return (U16)Var;
+}
+
+internal U32 U32FromU64Satruate(U64 x)
+{
+    U32 x32 = (x > U32Max) ? U32Max : (U32)x;
+    return x32;
+}
+
+typedef enum axis2
+{
+    AXIS2_INVALID = -1,
+    AXIS2_X,
+    AXIS2_Y,
+    AXIS2_COUNT
+}axis2;
+
+#define Axis2Flip(Axis) ((axis2)(!(Axis)))
+
+#endif

@@ -1,0 +1,3 @@
+@embed_file OSHandGrabCursorBytes:   "../../data/hand_grab.cur"
+@embed_file OSHandRotateCursorBytes: "../../data/hand_rotate.cur"
+@embed_file OSZoomInCursorBytes:     "../../data/zoom_in.cur"

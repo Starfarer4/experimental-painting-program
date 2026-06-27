@@ -1,0 +1,206 @@
+#if !defined(RENDERER_H)
+/*  =======================================================================
+    File: renderer.h
+    Date: March 6th 2024  2:41 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+#define RENDERER_H
+
+typedef U64 rnd_handle;
+
+typedef enum rnd_tex2d_sampler_kind
+{
+    RND_TEX2D_SAMPLER_KIND_NEAREST,
+    RND_TEX2D_SAMPLER_KIND_LINEAR,
+    RND_TEX2D_SAMPLER_KIND_COUNT
+}rnd_tex2d_sampler_kind;
+
+typedef struct rnd_rect2d_inst rnd_rect2d_inst;
+struct rnd_rect2d_inst
+{
+    rng2_f32 Position;
+    rng2_f32 TexCoords;
+    vec4_f32 Colors[4];
+    vec4_f32 CornerRadii;
+    F32 BorderThickness;
+    F32 Softness;
+    F32 WhiteTextureOverride;
+};
+
+typedef struct rnd_batch rnd_batch;
+struct rnd_batch
+{
+    rnd_batch *Next;
+    
+    U8 *Bytes;
+    U64 ByteCount;
+    U64 ByteCap;
+};
+
+typedef struct rnd_batch_list rnd_batch_list;
+struct rnd_batch_list
+{
+    rnd_batch *First;
+    rnd_batch *Last;
+    U64 BatchCount;
+    U64 ByteCount;
+    U64 BytesPerInst;
+};
+
+typedef struct rnd_batch_group_2d_params rnd_batch_group_2d_params;
+struct rnd_batch_group_2d_params
+{
+    rng2_f32 Clip;
+    rnd_handle Texture;
+    mat3x3_f32 Transform;
+    rnd_tex2d_sampler_kind TexSamplerKind;
+};
+
+typedef struct rnd_batch_group_2d rnd_batch_group_2d;
+struct rnd_batch_group_2d
+{
+    rnd_batch_group_2d *Next;
+    rnd_batch_list Batches;
+    rnd_batch_group_2d_params Params;
+};
+
+typedef struct rnd_batch_group_2d_list rnd_batch_group_2d_list;
+struct rnd_batch_group_2d_list
+{
+    rnd_batch_group_2d *First;
+    rnd_batch_group_2d *Last;
+    U64 Count;
+};
+
+typedef struct rnd_pass_params_ui rnd_pass_params_ui;
+struct rnd_pass_params_ui
+{
+    rnd_batch_group_2d_list Rects;
+};
+
+typedef struct rnd_pass_params_checkerboard rnd_pass_params_checkerboard;
+struct rnd_pass_params_checkerboard
+{
+    rng2_f32 Clip;
+    rng2_f32 Position;
+    vec2_f32 Offset;
+    F32 Turns;
+    F32 Size;
+    vec2_f32 Zoom;
+    mat3x3_f32 Transform;
+    vec4_f32 Color1;
+    vec4_f32 Color2;
+    vec4_f32 Background;
+};
+
+typedef enum rnd_pass_kind
+{
+    RND_PASS_KIND_UI,
+    RND_PASS_KIND_CHECKERBOARD
+}rnd_pass_kind;
+
+extern U8 RndPassKindBatchTable[1];
+extern U64 RndPassKindParamsSizeTable[1];
+
+typedef struct rnd_pass rnd_pass;
+struct rnd_pass
+{
+    void *Next;
+    void *Prev;
+    
+    rnd_pass_kind Kind;
+    union
+    {
+        void *Params;
+        rnd_pass_params_ui *UIParams;
+        rnd_pass_params_checkerboard *CheckerboardParams;
+    };
+};
+
+typedef struct rnd_pass_list rnd_pass_list;
+struct rnd_pass_list
+{
+    rnd_pass *First;
+    rnd_pass *Last;
+    U64 Count;
+};
+
+typedef enum rnd_vs_kind
+{
+    RND_VS_KIND_RECT,
+    RND_VS_KIND_CHECKERBOARD,
+    RND_VS_KIND_COUNT
+}rnd_vs_kind;
+
+typedef enum rnd_ps_kind
+{
+    RND_PS_KIND_RECT,
+    RND_PS_KIND_CHECKERBOARD,
+    RND_PS_KIND_COUNT
+}rnd_ps_kind;
+
+typedef struct rnd_uniform_rect rnd_uniform_rect;
+__declspec(align(16)) struct rnd_uniform_rect
+{
+    vec2_f32 Resolution;
+    vec2_f32 TexSize;
+    vec4_f32 TextureSampleChannelMap[4];
+    vec4_f32 Transform[3];
+    vec2_f32 TransformScale;
+};
+
+typedef struct rnd_uniform_checkerboard rnd_uniform_checkerboard;
+__declspec(align(16)) struct rnd_uniform_checkerboard
+{
+    vec2_f32 Resolution;
+    F32 Turns;
+    F32 Size;
+    rng2_f32 Position;
+    vec2_f32 Offset;
+    vec2_f32 Zoom;
+    vec4_f32 Transform[3];
+    vec4_f32 Color1;
+    vec4_f32 Color2;
+    vec4_f32 Background;
+};
+
+typedef enum rnd_uniform_kind
+{
+    RND_UNIFORM_KIND_RECT,
+    RND_UNIFORM_KIND_CHECKERBOARD,
+    RND_UNIFORM_KIND_COUNT
+}rnd_uniform_kind;
+
+typedef enum rnd_tex2d_kind
+{
+    RND_TEX2D_KIND_LONG_LIVED,
+    RND_TEX2D_KIND_TEMPORARY,
+}rnd_tex2d_kind;
+
+typedef enum rnd_tex2d_format
+{
+    RND_TEX2D_FORMAT_R8,
+    RND_TEX2D_FORMAT_A8,
+    RND_TEX2D_FORMAT_RG8,
+    RND_TEX2D_FORMAT_RGBA8,
+    RND_TEX2D_FORMAT_BGRA8,
+    RND_TEX2D_FORMAT_R16,
+    RND_TEX2D_FORMAT_RGBA16,
+    RND_TEX2D_FORMAT_R32,
+    RND_TEX2D_FORMAT_RG32,
+    RND_TEX2D_FORMAT_RGBA32,
+}rnd_tex2d_format;
+
+void RndStartUp();
+void RndWindowBeginFrame(os_handle OSWindow, rnd_handle RndWindow);
+void RndWindowEndFrame(os_handle OSWindow, rnd_handle RndWindow);
+void RndWindowSubmit(os_handle OSWindow, rnd_handle RndWindow, rnd_pass_list Passes);
+rnd_handle RndTex2DAlloc(rnd_tex2d_kind Kind, vec2_i32 Size, rnd_tex2d_format Format, void *Texels);
+void RndTex2DRelease(rnd_handle TextureHandle);
+void RndFillTex2DRegion(rnd_handle Handle, rng2_i32 Subrect, void *Texels);
+void RndUpdateTex2DResource(rnd_handle Handle, void *Texels, U64 DataSize);
+rnd_handle RndWindowEquip(os_handle OSWindow);
+void RndWindowUnequip(rnd_handle RndWindow);
+rnd_pass *RndPassFromKind(arena *Arena, rnd_pass_list *List, rnd_pass_kind Kind);
+
+#endif

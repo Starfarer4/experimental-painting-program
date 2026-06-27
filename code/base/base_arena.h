@@ -1,0 +1,52 @@
+#if !defined(BASE_ARENA_H)
+/*  =======================================================================
+    File: base_arena.h
+    Date: March 5th 2024 11:04 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+#define BASE_ARENA_H
+
+#ifndef ARENA_COMMIT_GRANULARITY
+#define ARENA_COMMIT_GRANULARITY Kilobytes(4)
+#endif
+
+#ifndef ARENA_DECOMMIT_THRESHOLD
+#define ARENA_DECOMMIT_THRESHOLD Megabytes(64)
+#endif
+
+typedef struct arena arena;
+struct arena
+{
+    U64 Pos;
+    U64 CommitPos;
+    U64 Size;
+    U64 Align;
+};
+
+typedef struct temp_arena temp_arena;
+struct temp_arena
+{
+    arena *Arena;
+    U64 Pos;
+};
+
+arena *ArenaAlloc(U64 Size);
+void ArenaRelease(arena *Arena);
+void *ArenaPushNoZero(arena *Arena, U64 Size);
+void *ArenaPushAligner(arena *Arena, U64 Alignment);
+void *ArenaPush(arena *Arena, U64 Size);
+void ArenaPopTo(arena *Arena, U64 Pos);
+void ArenaSetAutoAlign(arena *Arena, U64 Align);
+void ArenaPop(arena *Arena, U64 Size);
+void ArenaClear(arena *Arena);
+U64 ArenaPos(arena *Arena);
+
+#define PushStruct(Arena, Struct) (Struct *)ArenaPush((Arena), sizeof(Struct))
+#define PushStructNoZero(Arena, Struct) (Struct *)ArenaPushNoZero((Arena), sizeof(Struct))
+#define PushArrayNoZero(Arena, Type, Length) (Type *)ArenaPushNoZero((Arena), sizeof(Type) * (Length))
+#define PushArray(Arena, Type, Length) (Type *)ArenaPush((Arena), sizeof(Type) * (Length))
+
+temp_arena TempArenaBegin(arena *Arena);
+void TempArenaEnd(temp_arena Temp);
+
+#endif

@@ -1,0 +1,388 @@
+/*  =======================================================================
+    File: renderer_draw.c
+    Date: March 8th 2024 11:35 AM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+
+typedef struct rnd_draw_state rnd_draw_state;
+struct rnd_draw_state
+{
+    rnd_bucket *Buckets;
+    arena *FrameArena;
+    arena *Arena;
+};
+
+global_variable rnd_draw_state *RndDrawState = 0;
+
+#define RndStackPushImpl(NameUpper, NameLower, Type, Val)               \
+    rnd_bucket *Bucket = RndTopBucket();                                \
+    Type OldVal = Bucket->Top##NameUpper->Data;                         \
+    rnd_##NameLower##_node *Node = PushStruct(RndDrawState->FrameArena, rnd_##NameLower##_node); \
+    Node->Data = (Val);                                                 \
+    SLLStackPush(Bucket->Top##NameUpper, Node);                         \
+    ++Bucket->StackGen;                                                 \
+    return OldVal;
+
+#define RndStackPopImpl(NameUpper, NameLower, Type) \
+    rnd_bucket *Bucket = RndTopBucket();            \
+    Type PoppedVal = Bucket->Top##NameUpper->Data;  \
+    SLLStackPop(Bucket->Top##NameUpper);            \
+    ++Bucket->StackGen;                             \
+    return PoppedVal;
+
+#define RndStackTopImpl(NameUpper, NameLower, Type) \
+    rnd_bucket *Bucket = RndTopBucket();            \
+    Type TopVal = Bucket->Top##NameUpper->Data;     \
+    return TopVal;
+
+#include "generated/renderer_draw.meta.c"
+
+void RndDrawStartUp()
+{
+    arena *Arena = ArenaAlloc(Megabytes(4));
+    RndDrawState = PushStruct(Arena, rnd_draw_state);
+    RndDrawState->Arena = Arena;
+
+    RndDrawState->FrameArena = ArenaAlloc(Megabytes(4));
+}
+
+void RndDrawBeginFrame()
+{
+    ArenaClear(RndDrawState->FrameArena);
+    RndDrawState->Buckets = 0;
+}
+
+void RndDrawEndFrame()
+{
+}
+
+void RndSubmitBucket(os_handle OSWindow, rnd_handle RndWindow, rnd_bucket *Bucket)
+{
+    RndWindowSubmit(OSWindow, RndWindow, Bucket->Passes);
+}
+
+rnd_bucket *RndMakeBucket(arena *Arena)
+{
+    rnd_bucket *Bucket = PushStruct(Arena, rnd_bucket);
+    RndBucketStackInits
+
+    return Bucket;
+}
+
+void RndPushBucket(rnd_bucket *Bucket)
+{
+    SLLStackPush(RndDrawState->Buckets, Bucket);
+}
+
+void RndPopBucket()
+{
+    SLLStackPop(RndDrawState->Buckets);
+}
+
+void RndSubBucket(rnd_bucket *Bucket)
+{
+    arena *Arena = RndDrawState->FrameArena;
+    rnd_bucket *Src = Bucket;
+    rnd_bucket *Dst = RndTopBucket();
+    rng2_f32 DstClip = RndTopClip();
+    B8 DstClipIsSet = !(DstClip.Left == 0 && DstClip.Right == 0 &&
+                        DstClip.Top == 0 && DstClip.Bottom == 0);
+    for(rnd_pass *Pass = Src->Passes.First; Pass; Pass = Pass->Next)
+    {
+        rnd_pass *SrcPass = Pass;
+        rnd_pass *DstPass = RndPassFromKind(Arena, &Dst->Passes, SrcPass->Kind);
+        switch(DstPass->Kind)
+        {
+            case RND_PASS_KIND_UI:
+            {
+                rnd_pass_params_ui *SrcUI = SrcPass->UIParams;
+                rnd_pass_params_ui *DstUI = DstPass->UIParams;
+                for(rnd_batch_group_2d *SrcGroup = SrcUI->Rects.First; SrcGroup; SrcGroup = SrcGroup->Next)
+                {
+                    rnd_batch_group_2d *DstGroup = PushStruct(Arena, rnd_batch_group_2d);
+                    SLLQueuePush(DstUI->Rects.First, DstUI->Rects.Last, DstGroup);
+                    ++DstUI->Rects.Count;
+                    MemoryCopy(&DstGroup->Params, &SrcGroup->Params, sizeof(rnd_batch_group_2d_params));
+                    DstGroup->Batches = SrcGroup->Batches;
+                    //DstGroup->Params.Transform = RndTopTransform(); TODO: Maybe multiply for desired behavior? Unsure...
+                    if(DstClipIsSet)
+                    {
+                        B8 ClipIsSet = !(DstGroup->Params.Clip.Left == 0 &&
+                                         DstGroup->Params.Clip.Top == 0 &&
+                                         DstGroup->Params.Clip.Right == 0 &&
+                                         DstGroup->Params.Clip.Bottom == 0);
+                        DstGroup->Params.Clip = ClipIsSet ? Intersect2F32(DstClip, DstGroup->Params.Clip) : DstClip;
+                    }
+                }
+            }break;
+
+            case RND_PASS_KIND_CHECKERBOARD:
+            {
+                rnd_pass_params_checkerboard *SrcCheckerboard = SrcPass->CheckerboardParams;
+                rnd_pass_params_checkerboard *DstCheckerboard = DstPass->CheckerboardParams;
+
+                MemoryCopy(DstCheckerboard, SrcCheckerboard, sizeof(rnd_pass_params_checkerboard));
+                
+                if(DstClipIsSet)
+                {
+                    B8 ClipIsSet = !(DstCheckerboard->Clip.Left == 0 &&
+                                     DstCheckerboard->Clip.Top == 0 &&
+                                     DstCheckerboard->Clip.Right == 0 &&
+                                     DstCheckerboard->Clip.Bottom == 0);
+                    DstCheckerboard->Clip = ClipIsSet ? Intersect2F32(DstClip, DstCheckerboard->Clip) : DstClip;
+                }
+            }break;
+            
+            default:
+            {
+                DstPass->Params = SrcPass->Params;
+            }break;
+        }
+    }
+}
+
+rnd_bucket *RndTopBucket()
+{
+    return RndDrawState->Buckets;
+}
+
+void *RndBatchListPushInst(arena *Arena, rnd_batch_list *List, U64 BatchInstCap)
+{
+    void *Inst = 0;
+
+    rnd_batch *Batch = List->Last;
+    if(Batch == 0 || Batch->ByteCount + List->BytesPerInst > Batch->ByteCap)
+    {
+        Batch = PushStruct(Arena, rnd_batch);
+        Batch->ByteCap = BatchInstCap * List->BytesPerInst;
+        Batch->Bytes = PushArray(Arena, U8, Batch->ByteCap);
+        SLLQueuePush(List->First, List->Last, Batch);
+        ++List->BatchCount;
+    }
+
+    Inst = Batch->Bytes + Batch->ByteCount;
+    Batch->ByteCount += List->BytesPerInst;
+    List->ByteCount += List->BytesPerInst;
+
+    return Inst;
+}
+
+rnd_pass *RndGetPassFromKind(arena *Arena, rnd_pass_list *Passes, rnd_pass_kind Kind, U64 ParamsSize)
+{
+    rnd_pass *Pass = Passes->Last;
+    for(;Pass; Pass = Pass->Prev)
+        if(Pass->Kind == Kind) break;
+
+    if(Pass == 0)
+    {
+        Pass = PushStruct(Arena, rnd_pass);
+        SLLQueuePush(Passes->First, Passes->Last, Pass);
+        ++Passes->Count;
+        Pass->Kind = Kind;
+        Pass->Params = PushArray(Arena, U8, ParamsSize);
+    }
+    
+    return Pass;
+}
+
+rnd_rect2d_inst *RndRect(rng2_f32 Position, vec4_f32 Color, F32 CornerRadius, F32 BorderThickness, F32 EdgeSoftness)
+{
+    arena *Arena = RndDrawState->FrameArena;
+    
+    rnd_bucket *Bucket = RndDrawState->Buckets;
+    
+    rnd_pass *Pass = RndGetPassFromKind(Arena, &Bucket->Passes, RND_PASS_KIND_UI, sizeof(rnd_pass_params_ui));
+
+    rnd_pass_params_ui *PassParams = Pass->UIParams;
+    rnd_batch_group_2d_list *Rects = &PassParams->Rects;
+    rnd_batch_group_2d *Node = Rects->Last;
+    if(Node == 0 || Bucket->StackGen != Bucket->LastCmdStackGen)
+    {
+        Node = PushStruct(Arena, rnd_batch_group_2d);
+        SLLQueuePush(Rects->First, Rects->Last, Node);
+        ++Rects->Count;
+
+        rnd_batch_list Batches = {0};
+        Batches.BytesPerInst = sizeof(rnd_rect2d_inst);
+        Node->Batches = Batches;
+        Node->Params.Clip = Bucket->TopClip->Data;
+        Node->Params.Texture = 0;
+        Node->Params.Transform = Bucket->TopTransform->Data;
+        Node->Params.TexSamplerKind = Bucket->TopSamplerKind->Data;
+    }
+
+    rnd_rect2d_inst *Inst = (rnd_rect2d_inst *)RndBatchListPushInst(Arena, &Node->Batches, 256);
+    Inst->Position = Position;
+    Inst->Colors[0] = Color;
+    Inst->Colors[1] = Color;
+    Inst->Colors[2] = Color;
+    Inst->Colors[3] = Color;
+    Inst->CornerRadii = Vec4F32(CornerRadius, CornerRadius, CornerRadius, CornerRadius);
+    Inst->BorderThickness = BorderThickness;
+    Inst->Softness = EdgeSoftness;
+    Inst->WhiteTextureOverride = 1.0f;
+    Bucket->LastCmdStackGen = Bucket->StackGen;
+    return Inst;
+}
+
+rnd_rect2d_inst *RndImg(rng2_f32 Position, rng2_f32 TexCoords, rnd_handle Texture, vec4_f32 Color, F32 CornerRadius, F32 BorderThickness,
+                        F32 EdgeSoftness)
+{
+    arena *Arena = RndDrawState->FrameArena;
+
+    rnd_bucket *Bucket = RndDrawState->Buckets;
+
+    rnd_pass *Pass = RndGetPassFromKind(Arena, &Bucket->Passes, RND_PASS_KIND_UI, sizeof(rnd_pass_params_ui));
+
+    rnd_pass_params_ui *PassParams = Pass->UIParams;
+    rnd_batch_group_2d_list *Rects = &PassParams->Rects;
+    rnd_batch_group_2d *Node = Rects->Last;
+    if(Node && Node->Params.Texture == Texture && Bucket->StackGen == Bucket->LastCmdStackGen)
+    {
+        Node->Params.Texture = Texture;
+    }
+    else if(Node == 0 || Node->Params.Texture != Texture || Bucket->StackGen != Bucket->LastCmdStackGen)
+    {
+        Node = PushStruct(Arena, rnd_batch_group_2d);
+        SLLQueuePush(Rects->First, Rects->Last, Node);
+        ++Rects->Count;
+
+        rnd_batch_list Batches = {0};
+        Batches.BytesPerInst = sizeof(rnd_rect2d_inst);
+        Node->Batches = Batches;
+        Node->Params.Clip = Bucket->TopClip->Data;
+        Node->Params.Texture = Texture;
+        Node->Params.Transform = Bucket->TopTransform->Data;
+        Node->Params.TexSamplerKind = Bucket->TopSamplerKind->Data;
+    }
+
+    rnd_rect2d_inst *Inst = (rnd_rect2d_inst *)RndBatchListPushInst(Arena, &Node->Batches, 256);
+    Inst->Position = Position;
+    Inst->TexCoords = TexCoords;
+    Inst->Colors[0] = Color;
+    Inst->Colors[1] = Color;
+    Inst->Colors[2] = Color;
+    Inst->Colors[3] = Color;
+    Inst->CornerRadii = Vec4F32(CornerRadius, CornerRadius, CornerRadius, CornerRadius);
+    Inst->BorderThickness = BorderThickness;
+    Inst->Softness = EdgeSoftness;
+    Inst->WhiteTextureOverride = 0.0f;
+    Bucket->LastCmdStackGen = Bucket->StackGen;
+    return Inst;
+}
+
+rnd_fancy_run_list RndFancyRunListFromFancyStringList(arena *Arena, rnd_fancy_string_list *Strings)
+{
+    rnd_fancy_run_list RunList = {0};
+    for(rnd_fancy_string_node *Node = Strings->First; Node; Node = Node->Next)
+    {
+        rnd_fancy_run_node *DstNode = PushStruct(Arena, rnd_fancy_run_node);
+        DstNode->Run.Run = FontPushRunFromString(Arena, Node->String.Font, Node->String.Size, Node->String.String);
+        DstNode->Run.Color = Node->String.TextColor;
+        SLLQueuePush(RunList.First, RunList.Last, DstNode);
+        ++RunList.NodeCount;
+        RunList.Dimensions.X += DstNode->Run.Run.Dimensions.X;
+        RunList.Dimensions.Y = Max(RunList.Dimensions.Y, DstNode->Run.Run.Dimensions.Y);
+    }
+    return RunList;
+}
+
+void RndTruncatedFancyRunList(vec2_f32 Position, rnd_fancy_run_list *List, F32 MaxX, font_run TrailerRun)
+{
+    B8 TrailerEnabled = (List->Dimensions.X >= MaxX && TrailerRun.Dimensions.X < MaxX);
+    
+    F32 Advance = 0;
+    B8 TrailerFound = 0;
+    vec4_f32 LastColor = {0};
+    for(rnd_fancy_run_node *Node = List->First; Node; Node = Node->Next)
+    {
+        rnd_fancy_run *Run = &Node->Run;
+        LastColor = Run->Color;
+        for(font_piece *Piece = Run->Run.Pieces.First; Piece; Piece = Piece->Next)
+        {
+            if(TrailerEnabled && Advance + Piece->Advance >= (MaxX - TrailerRun.Dimensions.X))
+            {
+                TrailerFound = 1;
+                break;
+            }
+            if(!TrailerEnabled && Advance + Piece->Advance >= MaxX)
+                goto end_draw;
+
+            rnd_handle Texture = Piece->Texture;
+            vec2_f32 Offset = Piece->Offset;
+            rng2_f32 Source = Piece->Source;
+            vec2_f32 Size = Dim2F32(Source);
+            vec2_f32 DestPos = Vec2F32(Position.X + Offset.X + Advance, Position.Y + Offset.Y);
+            rng2_f32 Destination = Rng2F32(DestPos, Vec2F32(DestPos.X + Size.X, DestPos.Y + Size.Y));
+            
+            if(Size.X != 0 && Size.Y != 0 && Texture)
+            {
+                RndImg(Destination, Source, Texture, Run->Color, 0.0f, 0.0f, 0.0f);
+            }
+            Advance += Piece->Advance;
+        }
+        if(TrailerFound)
+            break;
+    }
+end_draw:
+
+    if(TrailerFound)
+    {
+        for(font_piece *Piece = TrailerRun.Pieces.First; Piece; Piece = Piece->Next)
+        {
+            rnd_handle Texture = Piece->Texture;
+            vec2_f32 Offset = Piece->Offset;
+            rng2_f32 Source = Piece->Source;
+            vec2_f32 Size = Dim2F32(Source);
+            vec2_f32 DestPos = Vec2F32(Position.X + Offset.X + Advance, Position.Y + Offset.Y);
+            rng2_f32 Destination = Rng2F32(DestPos, Vec2F32(DestPos.X + Size.X, DestPos.Y + Size.Y));
+            if(Size.X != 0 && Size.Y != 0 && Texture)
+            {
+                RndImg(Destination, Source, Texture, LastColor, 0.0f, 0.0f, 0.0f);
+            }
+            Advance += Piece->Advance;
+        }
+    }
+}
+
+void RndTextRun(vec2_f32 Position, font_run Run)
+{
+    F32 Advance = 0;
+    for(font_piece *Piece = Run.Pieces.First; Piece; Piece = Piece->Next)
+    {
+        rnd_handle Texture = Piece->Texture;
+        vec2_f32 Offset = Piece->Offset;
+        rng2_f32 Source = Piece->Source;
+        vec2_f32 Size = Dim2F32(Source);
+        vec2_f32 DestPos = Vec2F32(Position.X + Offset.X + Advance, Position.Y + Offset.Y);
+        rng2_f32 Destination = Rng2F32(DestPos, Vec2F32(DestPos.X + Size.X, DestPos.Y + Size.Y));
+        if(Size.X != 0 && Size.Y != 0 && Texture)
+        {
+            RndImg(Destination, Source, Texture, Vec4F32(1.0f, 1.0f, 1.0f, 1.0f), 0.0f, 0.0f, 0.0f);
+        }
+        Advance += Piece->Advance;
+    }
+}
+
+rnd_pass_params_checkerboard *RndCheckerboard(rng2_f32 Position, vec2_f32 Offset, F32 Turns, F32 Zoom, F32 Size,
+                                              vec4_f32 Color1, vec4_f32 Color2, vec4_f32 Background)
+{
+    arena *Arena = RndDrawState->FrameArena;
+
+    rnd_bucket *Bucket = RndDrawState->Buckets;
+
+    rnd_pass *Pass = RndGetPassFromKind(Arena, &Bucket->Passes, RND_PASS_KIND_CHECKERBOARD, sizeof(rnd_pass_params_checkerboard));
+    rnd_pass_params_checkerboard *Params = Pass->CheckerboardParams;
+    Params->Clip = Bucket->TopClip->Data;
+    Params->Position = Position;
+    Params->Transform = Bucket->TopTransform->Data;
+    Params->Offset = Offset;
+    Params->Turns = Turns;
+    Params->Size = Size;
+    Params->Zoom = Vec2F32(Zoom, Zoom);
+    Params->Color1 = Color1;
+    Params->Color2 = Color2;
+    Params->Background = Background;
+
+    return Params;
+}

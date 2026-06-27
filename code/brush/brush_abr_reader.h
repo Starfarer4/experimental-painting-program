@@ -1,0 +1,139 @@
+#if !defined(BRUSH_ABR_READER_H)
+/*  =======================================================================
+    File: brush_abr_reader.h
+    Date: June 26th 2024 11:36 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+#define BRUSH_ABR_READER_H
+
+typedef struct br_abr_brush_section_ptrs br_abr_brush_section_ptrs;
+struct br_abr_brush_section_ptrs
+{
+    U8 *SampleSectionPtr;
+    U8 *DescriptorSectionPtr;
+};
+
+// Reference https://codeberg.org/tonton-pixel/json-photoshop-scripting/src/branch/master/Documentation/Photoshop-Actions-File-Format
+typedef enum br_abr_descriptor_types
+{
+    BR_ABR_DESCRIPTOR_TYPES_ALIAS     = 0x976c6973, // 'alis'
+    BR_ABR_DESCRIPTOR_TYPE_BOOLEAN    = 0x626f6f6c, // 'bool'
+    BR_ABR_DESCRIPTOR_TYPE_STRING     = 0x54455854, // 'TEXT'
+    BR_ABR_DESCRIPTOR_TYPE_CLASS      = 0x74797065, // 'type'
+    BR_ABR_DESCRIPTOR_TYPE_DESCRIPTOR = 0x4f626a63, // 'Objc'
+    BR_ABR_DESCRIPTOR_TYPE_ENUMERATED = 0x656e756d, // 'enum'
+    BR_ABR_DESCRIPTOR_TYPE_FLOAT      = 0x646f7562, // 'doub'
+    BR_ABR_DESCRIPTOR_TYPE_INTEGER    = 0x6c6f6e67, // 'long'
+    BR_ABR_DESCRIPTOR_TYPE_LARGE_INT  = 0x636f6d70, // 'comp'
+    BR_ABR_DESCRIPTOR_TYPE_LIST       = 0x566c4c73, // 'VlLs'
+    BR_ABR_DESCRIPTOR_TYPE_NULL       = 0x6e756c6c, // 'null'
+    BR_ABR_DESCRIPTOR_TYPE_OBJ_REF    = 0x6f626a20, // 'obj '
+    BR_ABR_DESCRIPTOR_TYPE_PATH       = 0x50746820, // 'Pat '
+    BR_ABR_DESCRIPTOR_TYPE_UNIT_FLOAT = 0x556e7446, // 'UntF'
+    BR_ABR_DESCRIPTOR_TYPE_RAW_DATA   = 0x74647461  // 'tdta'
+}br_abr_descriptor_types;
+
+typedef enum br_abr_unit_types
+{
+    BR_ABR_UNIT_TYPES_ANGLE    = 0x23416e67, // '#Ang'
+    BR_ABR_UNIT_TYPES_DENSITY  = 0x2352736c, // '#Rsl'
+    BR_ABR_UNIT_TYPES_DISTANCE = 0x23526c74, // '#Rlt'
+    BR_ABR_UNIT_TYPES_NONE     = 0x234e6e65, // '#Nne'
+    BR_ABR_UNIT_TYPES_PERCENT  = 0x23507263, // '#Prc'
+    BR_ABR_UNIT_TYPES_PIXEL    = 0x2350786c  // '#Pxl'
+}br_abr_unit_types;
+
+typedef struct br_abr_unit_float br_abr_unit_float;
+struct br_abr_unit_float
+{
+    br_abr_unit_types Type;
+    F64 Value;
+};
+
+typedef struct br_abr_enumerated_value br_abr_enumerated_value;
+struct br_abr_enumerated_value
+{
+    string8 Type;
+    string8 Value;
+};
+
+typedef enum br_abr_brush_type
+{
+    BR_ABR_BRUSH_TYPE_NONE = 0,
+    BR_ABR_BRUSH_TYPE_COMPUTED,
+    BR_ABR_BRUSH_TYPE_SAMPLED,
+}br_abr_brush_type;
+
+// Reference https://community.kde.org/Krita/Photoshop_Mapping_Table
+typedef struct br_abr_brush_data br_abr_brush_data;
+struct br_abr_brush_data
+{
+    br_abr_brush_type Type;
+    
+    F64 Diameter;
+    F64 Spacing;
+
+    F64 Hardness;
+    F64 Angle;
+    F64 Roundness;
+    B8 FlipX;
+    B8 FlipY;
+    
+    string8 SampledDataTag;
+};
+
+typedef enum br_abr_control_type
+{
+    BR_ABR_CONTROL_TYPE_OFF               = 0,
+    BR_ABR_CONTROL_TYPE_FADE              = 1,
+    BR_ABR_CONTROL_TYPE_PEN_PRESSURE      = 2,
+    BR_ABR_CONTROL_TYPE_PEN_TILT          = 3,
+    BR_ABR_CONTROL_TYPE_STYLUS_WHEEL      = 4,
+    BR_ABR_CONTROL_TYPE_ROTATION          = 5,
+    BR_ABR_CONTROL_TYPE_INITIAL_DIRECTION = 6,
+    BR_ABR_CONTROL_TYPE_DIRECTION         = 7,
+}br_abr_control_type;
+
+typedef struct br_abr_variable_control br_abr_variable_control;
+struct br_abr_variable_control
+{
+    br_abr_control_type Type;
+    I32 FadeStep;
+    F64 SizeJitter;
+    F64 Minimum;
+};
+
+typedef struct br_abr_tip_dynamics_data br_abr_tip_dynamics_data;
+struct br_abr_tip_dynamics_data
+{
+    B8 Enabled;
+
+    B8 FlipXJitter;
+    B8 FlipYJitter;
+    B8 BrushProjection;
+    
+    F64 SizeJitter;
+    br_abr_variable_control SizeControl;
+    F64 MinimumDiameter;
+};
+
+typedef struct br_abr_paint_dynamics_data br_abr_paint_dynamics_data;
+struct br_abr_paint_dynamics_data
+{
+    B8 Enabled;
+
+    br_abr_variable_control FlowJitter;
+    br_abr_variable_control OpacityJitter;
+};
+
+typedef struct br_abr_load_data br_abr_load_data;
+struct br_abr_load_data
+{
+    br_brush_node *First;
+    br_brush_node *Last;
+};
+
+void BRParseABRType(arena *Arena, br_abr_load_data *Loaded, br_abr_descriptor_types Type, U8 **Bytes);
+void BRLoadFromABR(arena *Arena, U8 *Bytes, U64 Size, br_brush_list *List);
+
+#endif

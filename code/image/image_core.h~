@@ -1,0 +1,53 @@
+#if !defined(IMAGE_CORE_H)
+/*  =======================================================================
+    File: image_core.h
+    Date: May 15th 2024  3:31 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+#define IMAGE_CORE_H
+
+typedef struct im_raw_image im_raw_image;
+struct im_raw_image
+{
+    U32 Width, Height;
+    U8 *Pixels;
+};
+
+typedef enum im_image_status
+{
+    IM_IMAGE_STATUS_NONE,
+    IM_IMAGE_STATUS_VIEW_OPERATION,
+    IM_IMAGE_STATUS_BRUSH_OPERATION,
+}im_image_status;
+
+typedef struct im_image im_image;
+struct im_image
+{
+    rnd_handle Texture; // NOTE: This is always owned by the rendering threa
+
+    im_image_status Status;    
+    im_raw_image Result;
+    im_raw_image ScratchLayer;
+    im_raw_image Layer;
+
+    os_handle ImageMutex;
+    U64 Generation;
+};
+
+typedef enum im_image_loader_error
+{
+    IM_IMAGE_LOADER_ERROR_SUCCESS,
+    IM_IMAGE_LOADER_ERROR_CODEC_NOT_FOUND,
+    IM_IMAGE_LOADER_ERROR_LOADER,
+    IM_IMAGE_LOADER_ERROR_UNKNOWN,
+}im_image_loader_error;
+
+im_image_loader_error IMLoadImage(im_image *Image, string8 Path);
+void IMDeleteImage(im_image *Image);
+
+inline void IMSetImagePixel(im_raw_image *Image, vec2_i32 Position, vec4_f32 Color);
+inline vec4_f32 IMGetImagePixel(im_raw_image *Image, vec2_i32 Position);
+
+im_raw_image IMMakeRotatedRawImage(arena *Arena, im_raw_image *Image, F32 Turns);
+
+#endif

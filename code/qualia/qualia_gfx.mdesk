@@ -1,0 +1,56 @@
+@table(Name, DefaultDark)
+gf_theme_preset_color_table:
+{
+    {PLAIN_BACKGROUND, 0x0c0c0cfe}
+    {PLAIN_BORDER, 0xfefefe19}
+    {PLAIN_TEXT, 0xa08563ff}
+    {ALT_BACKGROUND, 0x0c0c0cfe}
+    {ALT_BORDER, 0xfefefe19}
+    {ALT_TEXT, 0xa08563ff}
+    {HIGHLIGHT, 0xffd77733}
+    {BORDER_HIGHLIGHT, 0xb27218ff}
+    {ALT_HIGHLIGHT, 0x14445cff}
+    {ERR_HIGHLIGHT, 0x873e23ff}
+    {TAB_ACTIVE, 0xa87a4c4D}
+    {TAB_INACTIVE, 0x42474c7f}
+    {WEAK_TEXT, 0xa08462af}
+    {DROP_SITE_OVERLAY, 0xffffff0c}
+    {CHECKERBOARD_COLOR_1, 0x292929ff}
+    {CHECKERBOARD_COLOR_2, 0x1a1a1aff}
+}
+
+@gen_enum gf_theme_color:
+{
+    @expand(gf_theme_preset_color_table a)
+        `GF_THEME_COLOR_$(a.Name),`;
+    `GF_THEME_COLOR_COUNT`;
+}
+
+@gen_data(`vec4_f32`) GFThemePresetColorsDefaultDark:
+{
+    @expand(gf_theme_preset_color_table a)
+        `RGBAFromU32Lit($(a.DefaultDark)),`;
+}
+
+@table(Icon, Text)
+gf_icon_table:
+{
+    {CLOSE, x}
+    {CHECKED, i}
+    {UNCHECKED, !}
+    {ARROW_UP, u}
+    {ARROW_DOWN, d}
+    {LIST, l}
+    {BRUSH, b}
+}
+
+@gen_enum gf_icon_kind:
+{
+    @expand(gf_icon_table a) `GF_ICON_KIND_$(a.Icon),`;
+    `GF_ICON_KIND_COUNT`;
+}
+
+@gen_data(`string8`) GFIconKindTextList:
+{
+    @expand(gf_icon_table a) `Str8LitComp("$(a.Text)"),`;
+}

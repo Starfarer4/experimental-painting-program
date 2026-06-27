@@ -1,0 +1,74 @@
+@table(Type, TypeLower)
+math_type_table:
+{
+    {F32 f32}
+    {F64 f64}
+    {I16 i16}
+    {I32 i32}
+    {I64 i64}
+}
+
+@table(Name, Opr)
+math_opr_table:
+{
+    {Add `+`}
+    {Sub `-`}
+    {Div `/`}
+    {Mul `*`}
+}
+
+// Vec2
+@gen
+{
+    @expand(math_type_table a) `typedef union vec2_$(a.TypeLower) vec2_$(a.TypeLower); union vec2_$(a.TypeLower) {struct{$(a.Type) X; $(a.Type) Y;}; $(a.Type) V[2];};`;
+    @expand(math_type_table a) `vec2_$(a.TypeLower) Vec2$(a.Type)($(a.Type) X, $(a.Type) Y);`;
+    @expand(math_opr_table o) @expand(math_type_table a) `vec2_$(a.TypeLower) $(o.Name)2$(a.Type)(vec2_$(a.TypeLower) First, vec2_$(a.TypeLower) Second);`;
+    @expand(math_type_table a) `$(a.Type) Dot2$(a.Type)(vec2_$(a.TypeLower) a, vec2_$(a.TypeLower) b);`;
+    @expand(math_type_table a) `vec2_$(a.TypeLower) Mix2$(a.Type)(vec2_$(a.TypeLower) First, vec2_$(a.TypeLower) Second, F32 Time);`;
+}
+
+@gen @c
+{
+    @expand(math_type_table a) `vec2_$(a.TypeLower) Vec2$(a.Type)($(a.Type) X, $(a.Type) Y) {return (vec2_$(a.TypeLower)){X, Y};}`;
+    @expand(math_opr_table o) @expand(math_type_table a) `vec2_$(a.TypeLower) $(o.Name)2$(a.Type)(vec2_$(a.TypeLower) First, vec2_$(a.TypeLower) Second) {return Vec2$(a.Type)(First.X $(o.Opr) Second.X, First.Y $(o.Opr) Second.Y);}`;
+    @expand(math_type_table a) `$(a.Type) Dot2$(a.Type)(vec2_$(a.TypeLower) a, vec2_$(a.TypeLower) b) {return a.X * b.X + a.Y * b.Y;}`;
+    @expand(math_type_table a) `vec2_$(a.TypeLower) Mix2$(a.Type)(vec2_$(a.TypeLower) First, vec2_$(a.TypeLower) Second, F32 Time) {vec2_$(a.TypeLower) Result = Vec2$(a.Type)(($(a.Type))Mix1F32((F32)First.X, (F32)Second.X, Time), ($(a.Type))Mix1F32((F32)First.Y, (F32)Second.Y, Time)); return Result;}`;
+}
+
+// Vec3
+@gen
+{
+    @expand(math_type_table a) `typedef union vec3_$(a.TypeLower) vec3_$(a.TypeLower); union vec3_$(a.TypeLower) {struct{$(a.Type) X; $(a.Type) Y; $(a.Type) Z;}; $(a.Type) V[3];};`;
+    @expand(math_type_table a) `vec3_$(a.TypeLower) Vec3$(a.Type)($(a.Type) X, $(a.Type) Y, $(a.Type) Z);`;
+    @expand(math_opr_table o) @expand(math_type_table a) `vec3_$(a.TypeLower) $(o.Name)3$(a.Type)(vec3_$(a.TypeLower) First, vec3_$(a.TypeLower) Second);`;
+    @expand(math_type_table a) `$(a.Type) Dot3$(a.Type)(vec3_$(a.TypeLower) a, vec3_$(a.TypeLower) b);`;
+    @expand(math_type_table a) `vec3_$(a.TypeLower) Mix3$(a.Type)(vec3_$(a.TypeLower) First, vec3_$(a.TypeLower) Second, F32 Time);`;
+    @expand(math_type_table a) `vec3_$(a.TypeLower) Cross3$(a.Type)(vec3_$(a.TypeLower) a, vec3_$(a.TypeLower) b);`;
+}
+
+@gen @c
+{
+    @expand(math_type_table a) `vec3_$(a.TypeLower) Vec3$(a.Type)($(a.Type) X, $(a.Type) Y, $(a.Type) Z) {return (vec3_$(a.TypeLower)){X, Y, Z};}`;
+    @expand(math_opr_table o) @expand(math_type_table a) `vec3_$(a.TypeLower) $(o.Name)3$(a.Type)(vec3_$(a.TypeLower) First, vec3_$(a.TypeLower) Second) {return Vec3$(a.Type)(First.X $(o.Opr) Second.X, First.Y $(o.Opr) Second.Y, First.Z $(o.Opr) Second.Z);}`;
+    @expand(math_type_table a) `$(a.Type) Dot3$(a.Type)(vec3_$(a.TypeLower) a, vec3_$(a.TypeLower) b) {return a.X * b.X + a.Y * b.Y + a.Z * b.Z;}`;
+    @expand(math_type_table a) `vec3_$(a.TypeLower) Mix3$(a.Type)(vec3_$(a.TypeLower) First, vec3_$(a.TypeLower) Second, F32 Time) {vec3_$(a.TypeLower) Result = Vec3$(a.Type)(($(a.Type))Mix1F32((F32)First.X, (F32)Second.X, Time), ($(a.Type))Mix1F32((F32)First.Y, (F32)Second.Y, Time), ($(a.Type))Mix1F32((F32)First.Z, (F32)Second.Z, Time)); return Result;}`;
+    @expand(math_type_table a) `vec3_$(a.TypeLower) Cross3$(a.Type)(vec3_$(a.TypeLower) a, vec3_$(a.TypeLower) b) {return Vec3$(a.Type)(a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.Z);}`;
+}
+
+// Vec4
+@gen
+{
+    @expand(math_type_table a) `typedef union vec4_$(a.TypeLower) vec4_$(a.TypeLower); union vec4_$(a.TypeLower) {struct{$(a.Type) X; $(a.Type) Y; $(a.Type) Z; $(a.Type) W;}; struct{$(a.Type) R; $(a.Type) G; $(a.Type) B; $(a.Type) A;}; $(a.Type) V[4];};`;
+    @expand(math_type_table a) `vec4_$(a.TypeLower) Vec4$(a.Type)($(a.Type) X, $(a.Type) Y, $(a.Type) Z, $(a.Type) W);`;
+    @expand(math_type_table a) `$(a.Type) Dot4$(a.Type)(vec4_$(a.TypeLower) a, vec4_$(a.TypeLower) b);`;
+    @expand(math_opr_table o) @expand(math_type_table a) `vec4_$(a.TypeLower) $(o.Name)4$(a.Type)(vec4_$(a.TypeLower) First, vec4_$(a.TypeLower) Second);`;
+    @expand(math_type_table a) `vec4_$(a.TypeLower) Mix4$(a.Type)(vec4_$(a.TypeLower) First, vec4_$(a.TypeLower) Second, F32 Time);`;
+}
+
+@gen @c
+{
+    @expand(math_type_table a) `$(a.Type) Dot4$(a.Type)(vec4_$(a.TypeLower) a, vec4_$(a.TypeLower) b) {return a.X * b.X + a.Y * b.Y + a.Z * b.Z + a.W * b.W;}`;
+    @expand(math_type_table a) `vec4_$(a.TypeLower) Vec4$(a.Type)($(a.Type) X, $(a.Type) Y, $(a.Type) Z, $(a.Type) W) {return (vec4_$(a.TypeLower)){X, Y, Z, W};}`;
+    @expand(math_opr_table o) @expand(math_type_table a) `vec4_$(a.TypeLower) $(o.Name)4$(a.Type)(vec4_$(a.TypeLower) First, vec4_$(a.TypeLower) Second) {return Vec4$(a.Type)(First.X $(o.Opr) Second.X, First.Y $(o.Opr) Second.Y, First.Z $(o.Opr) Second.Z, First.W $(o.Opr) Second.W);}`;
+    @expand(math_type_table a) `vec4_$(a.TypeLower) Mix4$(a.Type)(vec4_$(a.TypeLower) First, vec4_$(a.TypeLower) Second, F32 Time) {vec4_$(a.TypeLower) Result = Vec4$(a.Type)(($(a.Type))Mix1F32((F32)First.X, (F32)Second.X, Time), ($(a.Type))Mix1F32((F32)First.Y, (F32)Second.Y, Time), ($(a.Type))Mix1F32((F32)First.Z, (F32)Second.Z, Time), ($(a.Type))Mix1F32((F32)First.W, (F32)Second.W, Time)); return Result;}`;
+}

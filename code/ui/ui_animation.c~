@@ -1,0 +1,164 @@
+/*  =======================================================================
+    File: ui_animation.c
+    Date: May 1st 2024 10:54 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+
+global_variable ui_animation_state *UIAnimationState = 0;
+
+ui_animation_state *UIAnimationStateAlloc()
+{
+    ui_animation_state *State = 0;
+    arena *Arena = ArenaAlloc(Megabytes(4));
+    State = PushStruct(Arena, ui_animation_state);
+    State->Arena = Arena;
+
+    State->AnimatedTableSize = 4096;
+    State->AnimatedTable = PushArray(Arena, ui_animated_hash_slot, State->AnimatedTableSize);
+
+    return State;
+}
+
+void UISelectAnimationState(ui_animation_state *State)
+{
+    UIAnimationState = State;
+}
+
+void UIBeginAnimation(F32 AnimationDelta)
+{
+    UIAnimationState->AnimationDelta = AnimationDelta;
+}
+
+void UIEndAnimation()
+{
+    // Prune unused animates
+    for(U64 SlotIndex = 0; SlotIndex < UIAnimationState->AnimatedTableSize; ++SlotIndex)
+    {
+        for(ui_animated *Animated = UIAnimationState->AnimatedTable[SlotIndex].First, *Next = 0; Animated; Animated = Next)
+        {
+            Next = Animated->Next;
+            if(Animated->LastTouchedIndex < UIAnimationState->AnimateIndex)
+            {
+                DLLRemove(UIAnimationState->AnimatedTable[SlotIndex].First, UIAnimationState->AnimatedTable[SlotIndex].Last, Animated);
+                DLLPushBack(UIAnimationState->FirstFreeAnimated, UIAnimationState->LastFreeAnimated, Animated);
+            }
+        }
+    }
+    
+    ++UIAnimationState->AnimateIndex;
+}
+
+ui_animated *UIGetAnimatedFromKey(ui_key Key)
+{
+    U64 Slot = Key % UIAnimationState->AnimatedTableSize;
+    ui_animated *Animated = 0;
+    for(ui_animated *AnimatedTest = UIAnimationState->AnimatedTable[Slot].First; AnimatedTest; AnimatedTest = AnimatedTest->Next)
+    {
+        if(AnimatedTest->Key == Key)
+        {
+            Animated = AnimatedTest;
+            break;
+        }
+    }
+    return Animated;
+}
+
+F32 UIAnimatedTFromKey(ui_key Key)
+{
+    ui_animated *Animated = UIGetAnimatedFromKey(Key);
+    return Animated->T;
+}
+
+ui_key UIAnimated(ui_animation_rate Rate, B8 Active, ui_key Key)
+{
+    Assert(Key);
+
+    ui_animated *Animated = UIGetAnimatedFromKey(Key);
+    if(Animated == 0)
+    {
+        Animated = UIAnimationState->FirstFreeAnimated;
+        if(Animated)
+        {
+            DLLRemove(UIAnimationState->FirstFreeAnimated, UIAnimationState->LastFreeAnimated, Animated);
+            MemoryZero(Animated, sizeof(ui_animated));
+        }
+        else
+            Animated = PushStruct(UIAnimationState->Arena, ui_animated);
+
+        U64 Slot = Key % UIAnimationState->AnimatedTableSize;
+        DLLPushBack(UIAnimationState->AnimatedTable[Slot].First, UIAnimationState->AnimatedTable[Slot].Last, Animated);
+        Animated->Key = Key;
+        Animated->Rate = Rate;
+        Animated->T = 0.0f;
+    }
+
+    Animated->LastTouchedIndex = UIAnimationState->AnimateIndex;
+
+    // Animate
+    {
+        F32 Rate = 25.0f;
+        switch(Animated->Rate)
+        {
+            case UI_ANIMATION_RATE_FAST: Rate = 1 - PowF32(2.0f, (-50.0f * UIAnimationState->AnimationDelta)); break;
+            case UI_ANIMATION_RATE_SLOW: Rate = 1 - PowF32(2.0f, (-30.0f * UIAnimationState->AnimationDelta)); break;
+            case UI_ANIMATION_RATE_SLUG: Rate = 1 - PowF32(2.0f, (-15.0f * UIAnimationState->AnimationDelta)); break;
+            case UI_ANIMATION_RATE_SLOTH: Rate = 1 - PowF32(2.0f, (-5.0f * UIAnimationState->AnimationDelta)); break;
+        }
+
+        Animated->T += Rate * ((F32)Active - Animated->T);
+    }
+    
+    Assert(Animated->Rate == Rate);
+
+    return Key;
+}
+
+ui_key UIAnimatedKeyFromString(string8 String)
+{
+    ui_key Result = 0;
+    if(String.Size)
+    {
+        string8 HashPart = UIHashPartFromString(String);
+        Result = HashData(HashPart.String, HashPart.Size);
+    }
+    return Result;
+}
+
+ui_key UIAnimatedKeyFromStringFmt(string8 String, ...)
+{
+    temp_arena Scratch = GetScratch(0, 0);
+
+    va_list Args;
+    va_start(Args, String);
+    string8 FormattedString = PushStr8FmtV(Scratch.Arena, String, Args);
+    va_end(Args);
+
+    ui_key Result = UIAnimatedKeyFromString(FormattedString);
+
+    ReleaseScratch(Scratch);
+    
+    return Result;
+}
+
+ui_key UIAnimatedFromString(ui_animation_rate Rate, B8 Active, string8 String)
+{
+    ui_key Result = UIAnimatedKeyFromString(String);
+    UIAnimated(Rate, Active, Result);
+    return Result;
+}
+
+ui_key UIAnimatedFromStringFmt(ui_animation_rate Rate, B8 Active, string8 String, ...)
+{
+    temp_arena Scratch = GetScratch(0, 0);
+
+    va_list Args;
+    va_start(Args, String);
+    string8 FormattedString = PushStr8FmtV(Scratch.Arena, String, Args);
+    va_end(Args);
+
+    ui_key Animated = UIAnimatedFromString(Rate, Active, FormattedString);
+
+    ReleaseScratch(Scratch);
+
+    return Animated;
+}

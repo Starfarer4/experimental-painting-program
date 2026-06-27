@@ -1,0 +1,41 @@
+/*  =======================================================================
+    File: os_gfx.c
+    Date: March 7th 2024 11:01 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+
+#include "generated/os_gfx.meta.c"
+
+os_cursor_format OSLoadCursorFromBytes(arena *Arena, U8 *Bytes, U64 Size)
+{
+    U8 *StartBytes = Bytes;
+    
+    os_cursor_format Result = {0};
+    Assert(ReadLE16(&Bytes) == 0);
+    Assert(ReadLE16(&Bytes) == 2);
+    Result.NumImages = ReadLE16(&Bytes);
+    
+    for(U16 ImageIdx = 0; ImageIdx < Result.NumImages; ++ImageIdx)
+    {
+        os_cursor_image *Image = PushStruct(Arena, os_cursor_image);
+        Image->Width  = ReadLE8(&Bytes);
+        Image->Height = ReadLE8(&Bytes);
+        Image->PaletteColors = ReadLE8(&Bytes);
+
+        ReadLE8(&Bytes);
+
+        Image->HotspotX  = ReadLE16(&Bytes);
+        Image->HotspotY  = ReadLE16(&Bytes);
+        Image->DataSize  = ReadLE32(&Bytes);
+        Image->Offset    = ReadLE32(&Bytes);
+        Image->ImageData = (void *)(StartBytes + Image->Offset);
+        
+        if(*(U64 *)Image->ImageData == 0x89504e470d0a1a0a)             Image->Type = OS_CURSOR_IMAGE_TYPE_PNG;
+        else if(*(U32 *)((U8 *)Image->ImageData + 14) == 1)            Image->Type = OS_CURSOR_IMAGE_TYPE_MONO;
+        else                                                           Image->Type = OS_CURSOR_IMAGE_TYPE_COLOR;
+
+        DLLPushBack(Result.FirstImage, Result.LastImage, Image);
+    }
+
+    return Result;
+}

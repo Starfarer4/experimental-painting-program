@@ -1,0 +1,55 @@
+@table(NameUpper, NameLower, Type, Nil)
+rnd_bucket_stack_table:
+{
+    {Clip, clip, rng2_f32, `{0}`}
+    {Transform, transform, mat3x3_f32, `{1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f}`}
+    {SamplerKind, sampler_kind, rnd_tex2d_sampler_kind, `RND_TEX2D_SAMPLER_KIND_NEAREST`}
+}
+
+// Declare node types
+@gen
+{
+    @expand(rnd_bucket_stack_table a) `typedef struct rnd_$(a.NameLower)_node rnd_$(a.NameLower)_node; struct rnd_$(a.NameLower)_node {rnd_$(a.NameLower)_node *Next; $(a.Type) Data;};`;
+}
+
+// Define stacks
+@gen
+{
+    `#define RndDefineBucketStacks \\`;
+    @expand(rnd_bucket_stack_table a) `rnd_$(a.NameLower)_node *Top$(a.NameUpper); \\`;
+}
+
+// Declare node nils
+@gen
+{
+    `#define RndDefineBucketNodeNils \\`;
+    @expand(rnd_bucket_stack_table a) `global_variable rnd_$(a.NameLower)_node Nil$(a.NameUpper)Node = {0, $(a.Nil)}; \\`;
+}
+
+// Init stacks
+@gen
+{
+    `#define RndBucketStackInits \\`;
+    @expand(rnd_bucket_stack_table a) `Bucket->Top$(a.NameUpper) = &Nil$(a.NameUpper)Node; \\`;
+}
+
+// Define scopes
+@gen
+{
+    @expand(rnd_bucket_stack_table a) `#define Rnd$(a.NameUpper)Scope(Data) DeferLoop(RndPush$(a.NameUpper)(Data), RndPop$(a.NameUpper)())`
+}
+
+// Declare functions
+@gen
+{
+    @expand(rnd_bucket_stack_table a) `$(a.Type) RndPush$(a.NameUpper)($(a.Type) Data);`;
+    @expand(rnd_bucket_stack_table a) `$(a.Type) RndPop$(a.NameUpper)();`;
+    @expand(rnd_bucket_stack_table a) `$(a.Type) RndTop$(a.NameUpper)();`;
+}
+
+@gen @c
+{   
+    @expand(rnd_bucket_stack_table a) `$(a.Type) RndPush$(a.NameUpper)($(a.Type) Data) {RndStackPushImpl($(a.NameUpper), $(a.NameLower), $(a.Type), Data);}`;
+    @expand(rnd_bucket_stack_table a) `$(a.Type) RndPop$(a.NameUpper)() {RndStackPopImpl($(a.NameUpper), $(a.NameLower), $(a.Type));}`;
+    @expand(rnd_bucket_stack_table a) `$(a.Type) RndTop$(a.NameUpper)() {RndStackTopImpl($(a.NameUpper), $(a.NameLower), $(a.Type));}`;
+}

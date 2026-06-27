@@ -1,0 +1,721 @@
+/*  =======================================================================
+    File: ui_docking.c
+    Date: April 8th 2024 12:53 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+
+typedef struct ui_docking_state ui_docking_state;
+struct ui_docking_state
+{
+    ui_dock_node *FirstFreeDockNode;
+    ui_dock_node *LastFreeDockNode;
+
+    F32 WindowMinSize;
+    
+    F32 Delta;
+    
+    arena *Arena;
+};
+
+global_variable ui_docking_state *UIDockingState = 0;
+
+void UIDockingStartUp()
+{
+    arena *Arena = ArenaAlloc(Megabytes(4));
+    UIDockingState = PushStruct(Arena, ui_docking_state);
+    UIDockingState->Arena = Arena;
+    UIDockingState->WindowMinSize = 80.0f;
+}
+
+void UIDockingUpdate(F32 Delta)
+{
+    UIDockingState->Delta = Delta;
+}
+
+ui_dock_node *UIDockBuilderAllocNode()
+{
+    ui_dock_node *Result = 0;
+    if(UIDockingState->FirstFreeDockNode)
+    {
+        Result = UIDockingState->FirstFreeDockNode;
+        DLLRemove(UIDockingState->FirstFreeDockNode, UIDockingState->LastFreeDockNode, Result);
+        MemoryZero(Result, sizeof(ui_dock_node));
+    }
+    else
+        Result = PushStruct(UIDockingState->Arena, ui_dock_node);
+    
+    return Result;
+}
+
+void UIDockBuilderFreeNode(ui_dock_node *Node)
+{
+    DLLPushFront(UIDockingState->FirstFreeDockNode, UIDockingState->LastFreeDockNode, Node);
+}
+
+ui_dock_node *UIDockBuilderCreateNode(ui_dock_node_kind Kind, ui_dock_node_flags Flags, rng2_f32 ContentRect)
+{
+    ui_dock_node *Result = UIDockBuilderAllocNode();
+    Result->Kind = Kind;
+    Result->Flags = Flags;
+    
+    Result->Size = Dim2F32(ContentRect);
+    Result->Position = ContentRect.TopLeft;
+    
+    return Result;
+}
+
+void UIDockNodeTreeUpdateLocalPosSizeRec(ui_dock_node *Node, vec2_f32 Position, vec2_f32 Size)
+{
+    Node->Position = Position;
+    Node->Size = Size;
+    
+    if(Node->First)
+    {
+        ui_dock_node *Child0 = Node->First;
+        ui_dock_node *Child1 = Child0->Next;
+        vec2_f32 Child0Position = Position, Child1Position = Position;
+        vec2_f32 Child0Size = Size, Child1Size = Size;
+
+        F32 Spacing = 5.0f;
+        axis2 Axis = Node->SplitAxis;
+        F32 SizeAvail = Max(Size.V[Axis] - Spacing, 0.0f);
+
+        F32 SizeMinEach = Trunc(Min(SizeAvail, UIDockingState->WindowMinSize * 2.0f) * 0.5f);
+
+        if(Child0->WantLockSizeOnce && !Child1->WantLockSizeOnce)
+        {
+            Child0Size.V[Axis] = Child0->SizeRef.V[Axis] = Min(SizeAvail - 1.0f, Child0->Size.V[Axis]);
+            Child1Size.V[Axis] = Child1->SizeRef.V[Axis] = SizeAvail - Child0Size.V[Axis];
+            Assert(Child0->SizeRef.V[Axis] > 0.0f && Child1->SizeRef.V[Axis] > 0.0f);
+        }
+        else if(Child1->WantLockSizeOnce && !Child0->WantLockSizeOnce)
+        {
+            Child1Size.V[Axis] = Child1->SizeRef.V[Axis] = Min(SizeAvail - 1.0f, Child1->Size.V[Axis]);
+            Child0Size.V[Axis] = Child0->SizeRef.V[Axis] = SizeAvail - Child1Size.V[Axis];
+            Assert(Child0->SizeRef.V[Axis] > 0.0f && Child1->SizeRef.V[Axis] > 0.0f);
+        }
+        else if(Child0->WantLockSizeOnce && Child1->WantLockSizeOnce)
+        {
+            F32 SplitRatio = Child0Size.V[Axis] / (Child0Size.V[Axis] + Child1Size.V[Axis]);
+            Child0Size.V[Axis] = Child0->SizeRef.V[Axis] = Trunc(SizeAvail * SplitRatio);
+            Child1Size.V[Axis] = Child1->SizeRef.V[Axis] = SizeAvail - Child0Size.V[Axis];
+            Assert(Child0->SizeRef.V[Axis] > 0.0f && Child1->SizeRef.V[Axis] > 0.0f);
+        }
+        else
+        {
+            F32 SplitRatio = Child0->SizeRef.V[Axis] / (Child0->SizeRef.V[Axis] + Child1->SizeRef.V[Axis]);
+            Child0Size.V[Axis] = Max(SizeMinEach, Trunc(SizeAvail * SplitRatio + 0.5f));
+            Child1Size.V[Axis] = SizeAvail - Child0Size.V[Axis];
+        }
+
+        Child1Position.V[Axis] += Spacing + Child0Size.V[Axis];
+        Child0->WantLockSizeOnce = Child1->WantLockSizeOnce = 0;
+
+        UIDockNodeTreeUpdateLocalPosSizeRec(Child0, Child0Position, Child0Size);
+        UIDockNodeTreeUpdateLocalPosSizeRec(Child1, Child1Position, Child1Size);
+    }
+}
+
+void UIDockNodeTreeUpdateSplitterFindTouchingNodeRec(arena *Arena, ui_dock_node *Node, axis2 Axis, U32 Side,
+                                                     ui_dock_node_list *TouchingNodes)
+{
+    if(Node->First)
+    {
+        if(Node->SplitAxis != Axis || Side == 0)
+            UIDockNodeTreeUpdateSplitterFindTouchingNodeRec(Arena, Node->First, Axis, Side, TouchingNodes);
+        if(Node->SplitAxis != Axis || Side == 1)
+            UIDockNodeTreeUpdateSplitterFindTouchingNodeRec(Arena, Node->First->Next, Axis, Side, TouchingNodes);
+    }
+    else
+    {
+        ui_dock_node_list_node *ListNode = PushStruct(Arena, ui_dock_node_list_node);
+        ListNode->Node = Node;
+        DLLPushBack(TouchingNodes->First, TouchingNodes->Last, ListNode);
+        ++TouchingNodes->Size;
+    }
+}
+
+void UIDockNodeUpdateChildrenChangingDockBoundariesRec(ui_dock_node *Node, B8 ChangingDockBoundaries)
+{
+    if(Node->First == 0)
+        Node->ChangingDockBoundaries = ChangingDockBoundaries;
+
+    if(Node->First) UIDockNodeUpdateChildrenChangingDockBoundariesRec(Node->First, ChangingDockBoundaries);
+    if(Node->First && Node->First->Next) UIDockNodeUpdateChildrenChangingDockBoundariesRec(Node->First->Next, ChangingDockBoundaries);
+}
+
+B8 UIDockingSplitterBehavior(rng2_f32 BoundingBox, ui_dock_node *Child1, ui_dock_node *Child2, axis2 Axis, F32 *Size1, F32 *Size2,
+                             F32 MinSize1, F32 MinSize2)
+{
+    B8 Held = 0;
+    UIParent(UIGetBoxRootFromState(UIState)) UIRect(BoundingBox) UIHoverCursor(Axis == AXIS2_X ? OS_CURSOR_LEFT_RIGHT : OS_CURSOR_UP_DOWN)
+    {
+        ui_box *Box = UIMakeBoxFromStringFmt(UI_BOX_FLAG_CLICKABLE, Str8Lit("###DockSplitter_%p_%p"), Child1, Child2);
+        UISetNextClickOffset(Vec4F32(BoundingBox.Right, BoundingBox.Bottom, 0.0f, 0.0f));
+        ui_signal Signal = UISignalFromBox(Box);
+
+        if(Signal.Flags & UI_SIGNAL_FLAGS_LEFT_DRAGGING)
+        {
+            UIDockNodeUpdateChildrenChangingDockBoundariesRec(Child1, 1);
+            UIDockNodeUpdateChildrenChangingDockBoundariesRec(Child2, 1);
+            
+            F32 MouseDelta = UIDragDelta().V[Axis] + UIDragClickOffset().V[Axis] - BoundingBox.BottomRight.V[Axis];
+
+            F32 Size1MaxDelta = Max(0.0f, *Size1 - MinSize1);
+            F32 Size2MaxDelta = Max(0.0f, *Size2 - MinSize2);
+            if(MouseDelta < -Size1MaxDelta) MouseDelta = -Size1MaxDelta;
+            if(MouseDelta > Size2MaxDelta) MouseDelta = Size2MaxDelta;
+
+            if(MouseDelta != 0.0f)
+            {
+                *Size1 = Max(*Size1 + MouseDelta, MinSize1);
+                *Size2 = Max(*Size2 - MouseDelta, MinSize2);
+            }
+
+            Held = 1;
+        }
+    }
+
+    return Held;
+}
+
+void UILocalDockNodeTreeUpdateSplitterRec(ui_dock_node *Node)
+{
+    if(Node->First)
+    {
+        ui_dock_node *Child0 = Node->First;
+        ui_dock_node *Child1 = Child0->Next;
+
+        axis2 Axis = Node->SplitAxis;
+        rng2_f32 BoundingBox = Rng2F32(Child0->Position, Child1->Position);
+        BoundingBox.TopLeft.V[Axis] += Child0->Size.V[Axis];
+        BoundingBox.BottomRight.V[Axis2Flip(Axis)] += Child1->Size.V[Axis2Flip(Axis)];
+
+        F32 SpacingSize = 0.0f;
+        BoundingBox.TopLeft.V[Axis] -= SpacingSize;
+        BoundingBox.BottomRight.V[Axis] += SpacingSize;
+
+        {
+            temp_arena Scratch = GetScratch(0, 0);
+
+            ui_dock_node_list TouchingNodes[2];
+            MemoryZero(TouchingNodes, sizeof(TouchingNodes));
+            F32 MinSize = UIDockingState->WindowMinSize;
+            F32 ResizeLimits[2];
+            ResizeLimits[0] = Child0->Position.V[Axis] + MinSize;
+            ResizeLimits[1] = Child1->Position.V[Axis] + Child1->Size.V[Axis] - MinSize;
+
+            UIDockNodeTreeUpdateSplitterFindTouchingNodeRec(Scratch.Arena, Child0, Axis, 1, &TouchingNodes[0]);
+            UIDockNodeTreeUpdateSplitterFindTouchingNodeRec(Scratch.Arena, Child1, Axis, 0, &TouchingNodes[1]);
+
+            for(ui_dock_node_list_node *TouchingNodeN = TouchingNodes[0].First;
+                TouchingNodeN;
+                TouchingNodeN = TouchingNodeN->Next)
+            {
+                ResizeLimits[0] = Max(ResizeLimits[0], TouchingNodeN->Node->Position.V[Axis] + MinSize);
+
+                vec2_f32 BottomRight = Add2F32(TouchingNodeN->Node->Position, TouchingNodeN->Node->Size);
+                ResizeLimits[1] = Max(ResizeLimits[1], BottomRight.V[Axis] - MinSize);
+            }
+            
+            F32 CurSize0 = Child0->Size.V[Axis];
+            F32 CurSize1 = Child1->Size.V[Axis];
+            F32 MinSize0 = ResizeLimits[0] - Child0->Position.V[Axis];
+            F32 MinSize1 = Child1->Position.V[Axis] + Child1->Size.V[Axis] - ResizeLimits[1];
+            if(UIDockingSplitterBehavior(BoundingBox, Child0, Child1, Axis, &CurSize0, &CurSize1, MinSize0, MinSize1))
+            {
+                if(TouchingNodes[0].Size > 0 && TouchingNodes[1].Size > 0)
+                {
+                    Child0->Size.V[Axis] = Child0->SizeRef.V[Axis] = CurSize0;
+                    Child1->Position.V[Axis] -= CurSize1 - Child1->Size.V[Axis];
+                    Child1->Size.V[Axis] = Child1->SizeRef.V[Axis] = CurSize1;
+
+                    for(U32 SideN = 0; SideN < 2; ++SideN)
+                    {
+                        for(ui_dock_node_list_node *TouchingNodeN = TouchingNodes[SideN].First;
+                            TouchingNodeN;
+                            TouchingNodeN = TouchingNodeN->Next)
+                        {
+                            for(ui_dock_node *TouchingNode = TouchingNodeN->Node;
+                                TouchingNode->Parent != Node;
+                                TouchingNode = TouchingNode->Parent)
+                            {
+                                ui_dock_node *NodeToPreserve = TouchingNode->Parent->First;
+                                for(U32 SideNN = SideN; SideNN > 0; --SideNN) NodeToPreserve = NodeToPreserve->Next;
+                                NodeToPreserve->WantLockSizeOnce = 1;
+                            }
+                        }
+                    }
+
+                    UIDockNodeTreeUpdateLocalPosSizeRec(Child0, Child0->Position, Child0->Size);
+                    UIDockNodeTreeUpdateLocalPosSizeRec(Child1, Child1->Position, Child1->Size);
+                }
+            }
+            
+            ReleaseScratch(Scratch);
+        }
+
+        UILocalDockNodeTreeUpdateSplitterRec(Child0);
+        UILocalDockNodeTreeUpdateSplitterRec(Child1);
+    }
+}
+
+void UIUpdateDockNodeForDPIChange(ui_dock_node *Node, rng2_f32 ContentRect, F32 DPIScaleFactor)
+{
+    Assert(Node->Kind == UI_DOCK_NODE_KIND_CENTRAL);
+
+    for(ui_dock_node *Sister = Node->Next; Sister; Sister = Sister->Next)
+    {
+        axis2 Axis = (Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT ||
+                              Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_RIGHT) ? AXIS2_X : AXIS2_Y;
+        Sister->Size.V[Axis] *= DPIScaleFactor;
+    }
+}
+
+void UIUpdateDockNode(ui_dock_node *Node, rng2_f32 ContentRect, B8 SkipAnimation)
+{
+    UIUpdateDockNodePosSize(Node, ContentRect);
+
+    // Create docking splitter behavior
+    if(Node->Kind == UI_DOCK_NODE_KIND_CENTRAL)
+    {
+        UILocalDockNodeTreeUpdateSplitterRec(Node);
+        
+        for(ui_dock_node *Sister = Node->Next; Sister; Sister = Sister->Next)
+        {
+            if(Sister->Flags & UI_DOCK_NODE_FLAGS_ONE_TAB) continue;
+
+            B8 Clipping = 0;
+            for(ui_dock_node *Sibling = Sister->Prev; Sibling && UIState; Sibling = Sibling->Prev)
+            {
+                if(Sibling == Sister || Sibling == Node) continue;
+                rng2_f32 SiblingRect = Rng2F32(Sibling->Position, Add2F32(Sibling->Size, Sibling->Position));
+                if(Contains2F32(SiblingRect, UIMouse()))
+                {
+                    Clipping = 1;
+                    break;
+                }
+            }
+
+            if(UIState && !(Clipping && UIState->HotBoxKey == 0))
+            {
+                axis2 Axis = (Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT ||
+                              Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_RIGHT) ? AXIS2_X : AXIS2_Y;
+
+                rng2_f32 DockRect = Rng2F32(Sister->Position, Add2F32(Sister->Size, Sister->Position));
+                    
+                rng2_f32 SplitterRect = DockRect;
+                SplitterRect.TopLeft.X += Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT ? Sister->Size.X - 0.0f : 0.0f;
+                SplitterRect.TopLeft.Y += Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_UP ? Sister->Size.Y - 0.0f : 0.0f;
+                SplitterRect.BottomRight.X -= Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_RIGHT ? Sister->Size.X - 0.0f : 0.0f;
+                SplitterRect.BottomRight.Y -= Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_DOWN ? Sister->Size.Y - 0.0f : 0.0f;
+
+                SplitterRect.BottomRight.X += Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT ? 5.0f : 0.0f;
+                SplitterRect.TopLeft.X -= Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_RIGHT ? 5.0f : 0.0f;
+                SplitterRect.TopLeft.Y -= Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_DOWN ? 5.0f : 0.0f;
+                SplitterRect.BottomRight.Y += Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_UP ? 5.0f : 0.0f;
+
+                UIRect(SplitterRect) UIHoverCursor(Axis == AXIS2_X ? OS_CURSOR_LEFT_RIGHT : OS_CURSOR_UP_DOWN)
+                {
+                    ui_box *Box = UIMakeBoxFromStringFmt(UI_BOX_FLAG_CLICKABLE, Str8Lit("###DockSplitter_%p"), Sister);
+                    
+                    UISetNextClickOffset(Vec4F32(SplitterRect.Right, SplitterRect.Bottom, 0.0f, 0.0f));
+                    ui_signal Signal = UISignalFromBox(Box);
+
+                    if(Signal.Flags & UI_SIGNAL_FLAGS_LEFT_DRAGGING)
+                    {
+                        for(ui_dock_node *Sibling = Node; Sibling; Sibling = Sibling->Next)
+                            UIDockNodeUpdateChildrenChangingDockBoundariesRec(Sibling, 1);
+                        
+                        F32 MouseDelta = UIDragDelta().V[Axis] + UIDragClickOffset().V[Axis] - SplitterRect.BottomRight.V[Axis];
+                            
+                        Sister->Size.V[Axis] += ((Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT) ||
+                                                 (Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_UP)) ? MouseDelta : -MouseDelta;
+                        Sister->Size.V[Axis] = Max(Sister->Size.V[Axis], UIDockingState->WindowMinSize);
+                    }
+                }
+
+                UIUpdateDockNodePosSize(Node, ContentRect);
+                UILocalDockNodeTreeUpdateSplitterRec(Sister);
+            }
+        }
+    }
+
+    // Animate dock node
+    F32 Rate = 1.0f - PowF32(2.0f, (-50.0f * UIDockingState->Delta));
+    for(ui_dock_node *N = Node; N; N = UIGetDockNodeRecursionPre(N))
+    {
+        Assert(!(N->First && (N->Tabs.FirstTabView || N->Tabs.LastTabView || N->Tabs.TabViewCount)));
+
+        if(N->First) continue;
+
+        // Animate positions
+        N->AnimatedPos.X += Rate * (N->Position.X - N->AnimatedPos.X);
+        N->AnimatedPos.Y += Rate * (N->Position.Y - N->AnimatedPos.Y);
+        if(AbsF32(N->Position.X - N->AnimatedPos.X) < 1.0f)
+            N->AnimatedPos.X = N->Position.X;
+        if(AbsF32(N->Position.Y - N->AnimatedPos.Y) < 1.0f)
+            N->AnimatedPos.Y = N->Position.Y;
+
+        // Animate sizes
+        N->AnimatedSize.X += Rate * (N->Size.X - N->AnimatedSize.X);
+        N->AnimatedSize.Y += Rate * (N->Size.Y - N->AnimatedSize.Y);
+        if(AbsF32(N->Size.X - N->AnimatedSize.X) < 1.0f)
+            N->AnimatedSize.X = N->Size.X;
+        if(AbsF32(N->Size.Y - N->AnimatedSize.Y) < 1.0f)
+            N->AnimatedSize.Y = N->Size.Y;
+
+        if(SkipAnimation || N->ChangingDockBoundaries)
+        {
+            N->AnimatedPos = N->Position;
+            N->AnimatedSize = N->Size;
+            N->ChangingDockBoundaries = 0;
+        }
+    }
+}
+
+void UIUpdateDockNodePosSize(ui_dock_node *Node, rng2_f32 ContentRect)
+{
+    Node->Size = Dim2F32(ContentRect);
+    Node->Size.X = Max(Node->Size.X, UIDockingState->WindowMinSize);
+    Node->Size.Y = Max(Node->Size.Y, UIDockingState->WindowMinSize);
+        
+    Node->Position = ContentRect.TopLeft;
+    
+    switch(Node->Kind)
+    {
+        case UI_DOCK_NODE_KIND_CENTRAL:
+        {
+            // Position and size central node and global nodes
+            for(I32 Axis = AXIS2_COUNT - 1; Axis >= 0; --Axis)
+            {
+                for(ui_dock_node *Sister = Node->Next; Sister; Sister = Sister->Next)
+                {
+                    axis2 SplitAxis = (Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT ||
+                                       Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_RIGHT) ? AXIS2_X : AXIS2_Y;
+                    if(SplitAxis == Axis)
+                    {
+                        Node->Size.V[Axis] -= Sister->Size.V[Axis] + 5.0f;
+                        Sister->Size.V[Axis2Flip(Axis)] = Node->Size.V[Axis2Flip(Axis)];
+                        Sister->Position = Node->Position;
+                    
+                        if(Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_UP || Sister->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT)
+                            Node->Position.V[Axis] += Sister->Size.V[Axis] + 5.0f;
+                        else
+                            Sister->Position.V[Axis] += Node->Size.V[Axis] + 5.0f;
+
+                        Assert(Sister->Size.V[Axis] >= 0.0f);
+                    }
+                }
+            }
+
+            Node->Size.X = Max(Node->Size.X, UIDockingState->WindowMinSize);
+            Node->Size.Y = Max(Node->Size.Y, UIDockingState->WindowMinSize);
+
+            // Iterate through all top-level nodes to position and size their children.
+            for(ui_dock_node *Sister = Node; Sister; Sister = Sister->Next)
+            {
+                UIDockNodeTreeUpdateLocalPosSizeRec(Sister, Sister->Position, Sister->Size);
+            }
+        }break;
+
+        case UI_DOCK_NODE_KIND_LOCAL:
+        {
+            UIDockNodeTreeUpdateLocalPosSizeRec(Node, Node->Position, Node->Size);
+        }break;
+
+        default:
+        {
+            Error("Unsupported node kind %u passed to function UIUpdateDockNodePosSize\n", Node->Kind);
+        }break;
+    }
+}
+
+void UIDockNodeMoveChildNodes(ui_dock_node *DstNode, ui_dock_node *SrcNode)
+{
+    DstNode->First = SrcNode->First;
+    DstNode->Last = SrcNode->Last;
+    for(ui_dock_node *Child = DstNode->First; Child; Child = Child->Next)
+        Child->Parent = DstNode;
+    DstNode->SplitAxis = SrcNode->SplitAxis;
+    DstNode->SizeRef = SrcNode->SizeRef;
+    SrcNode->First = SrcNode->Last = 0;
+}
+
+void UIDockNodeMoveTabs(ui_dock_node *Dst, ui_dock_node *Src)
+{
+    MemoryCopy(&Dst->Tabs, &Src->Tabs, sizeof(ui_dock_node_tabs));
+    MemoryZero(&Src->Tabs, sizeof(ui_dock_node_tabs));
+}
+
+ui_dock_node *UIDockBuilderSplitNode(ui_dock_node *NodeToSplit, ui_dockspace_split_dir SplitDir, F32 DockSize, ui_dock_node **NewNode,
+                                     ui_dock_node **OldNode, ui_dock_node_flags Flags, B8 SplitAsLocal)
+{
+    ui_dock_node *Node = UIDockBuilderAllocNode();
+    Node->Flags = Flags;
+
+    axis2 SplitAxis = (SplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT || SplitDir == UI_DOCKSPACE_SPLIT_DIR_RIGHT) ? AXIS2_X : AXIS2_Y;
+    
+    switch(NodeToSplit->Kind)
+    {
+        case UI_DOCK_NODE_KIND_CENTRAL:
+        {
+            if(!SplitAsLocal)
+            {
+                Node->Kind = UI_DOCK_NODE_KIND_GLOBAL;
+                Node->GlobalSplitDir = SplitDir;
+                Node->Size.V[SplitAxis] = DockSize;
+                Node->AnimatedPos = NodeToSplit->Position;
+                Node->Flags = Flags;
+            
+                ui_dock_node *Last = NodeToSplit;
+                while(Last->Next) Last = Last->Next;
+                ui_dock_node *First = NodeToSplit;
+                
+                ui_dock_node *PrevNode = First;
+                for(ui_dock_node *NextNode = First->Next; NextNode; NextNode = NextNode->Next)
+                    if(NextNode->Kind == UI_DOCK_NODE_KIND_GLOBAL && NextNode->GlobalSplitDir == SplitDir)
+                    {
+                        PrevNode = NextNode->Prev;
+                        break;
+                    }
+                    
+                DLLInsert(First, Last, PrevNode, Node);
+
+                // Update the positions and sizes of the dock nodes
+                UIUpdateDockNodePosSize(NodeToSplit, Rng2F32(NodeToSplit->Position, Add2F32(NodeToSplit->Position, NodeToSplit->Size)));
+            }
+            else
+                goto split_local_node;
+        }break;
+
+        case UI_DOCK_NODE_KIND_GLOBAL:
+        {
+            axis2 NodeToSplitAxis = (NodeToSplit->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT ||
+                                     NodeToSplit->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_RIGHT) ? AXIS2_X : AXIS2_Y;
+            
+            if(SplitAxis == NodeToSplitAxis && !SplitAsLocal)
+            {
+                Node->Kind = UI_DOCK_NODE_KIND_GLOBAL;
+                Node->GlobalSplitDir = NodeToSplit->GlobalSplitDir;
+                Node->Size.V[SplitAxis] = DockSize;
+                Node->AnimatedPos = NodeToSplit->Position;
+                Node->Flags = Flags;
+
+                ui_dock_node *First = NodeToSplit;
+                while(First->Prev) First = First->Prev;
+                ui_dock_node *Last = NodeToSplit;
+                while(Last->Next) Last = Last->Next;
+
+                ui_dock_node *Prev = NodeToSplit;
+                if(SplitDir == NodeToSplit->GlobalSplitDir)
+                    Prev = NodeToSplit->Prev;
+
+                DLLInsert(First, Last, Prev, Node);
+
+                // Update the positions and sizes of the dock nodes
+                UIUpdateDockNodePosSize(First, Rng2F32(NodeToSplit->Position, Add2F32(NodeToSplit->Position, NodeToSplit->Size)));
+            }
+            else
+                goto split_local_node;
+        }break;
+
+        case UI_DOCK_NODE_KIND_LOCAL:
+        {
+    split_local_node:
+            Assert((NodeToSplit->Flags & UI_DOCK_NODE_FLAGS_ONE_TAB) == 0);
+            U32 SplitInheritorIdx = (SplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT || SplitDir == UI_DOCKSPACE_SPLIT_DIR_UP) ? 1 : 0;
+                
+            ui_dock_node *Child0 = Node;
+            ui_dock_node *Child1 = UIDockBuilderAllocNode();
+
+            Child0->Kind = UI_DOCK_NODE_KIND_LOCAL;
+            Child1->Kind = UI_DOCK_NODE_KIND_LOCAL;
+            Child0->Parent = NodeToSplit;
+            Child1->Parent = NodeToSplit;
+            Child0->AnimatedPos = NodeToSplit->Position;
+            Child1->AnimatedPos = NodeToSplit->Position;
+
+            ui_dock_node *ChildInheritor = (SplitInheritorIdx == 0) ? Child0 : Child1;
+            UIDockNodeMoveChildNodes(ChildInheritor, NodeToSplit);
+            DLLPushBack(NodeToSplit->First, NodeToSplit->Last, Child0);
+            DLLPushBack(NodeToSplit->First, NodeToSplit->Last, Child1);
+            NodeToSplit->SplitAxis = SplitAxis;
+
+            F32 SizeAvail = NodeToSplit->Size.V[SplitAxis] - 2.0f;
+            SizeAvail = Max(SizeAvail, UIDockingState->WindowMinSize);
+            Assert(SizeAvail > 0.0f);
+            Child0->SizeRef = Child1->SizeRef = Node->Size;
+            Child0->SizeRef.V[SplitAxis] = Trunc(SizeAvail * DockSize);
+            Child1->SizeRef.V[SplitAxis] = Trunc(SizeAvail - Child0->SizeRef.V[SplitAxis]);
+
+            UIDockNodeTreeUpdateLocalPosSizeRec(NodeToSplit, NodeToSplit->Position, NodeToSplit->Size);
+
+            ui_dock_node *Inheritor = (SplitInheritorIdx == 0) ? Child0 : Child1;
+            Inheritor->Flags = NodeToSplit->Flags;            
+            UIDockNodeMoveTabs(Inheritor, NodeToSplit);
+            
+            Node = (SplitInheritorIdx == 0) ? Child1 : Child0;
+            Node->Flags = Flags;
+            if(OldNode) *OldNode = Inheritor;
+        }break;
+    }
+
+    if(NewNode) *NewNode = Node;
+    
+    return Node;
+}
+
+ui_dock_node *UIGetDockNodeRecursionPre(ui_dock_node *Node)
+{
+    ui_dock_node *Result = 0;
+    if(Node->First)
+        Result = Node->First;
+    else
+        for(ui_dock_node *Parent = Node; Parent; Parent = Parent->Parent)
+        {
+            if(Parent->Next)
+            {
+                Result = Parent->Next;
+                break;
+            }
+        }
+    return Result;
+}
+
+ui_dock_node_rec UIGetDockNodeRecursionPost(ui_dock_node *Node)
+{
+    ui_dock_node_rec Result = {0};
+    if(Node->Last)
+    {
+        Result.Next = Node->Last;
+        ++Result.PushCount;
+    }
+    else
+    {
+        for(ui_dock_node *Parent = Node; Parent; Parent = Parent->Parent, ++Result.PopCount)
+        {
+            if(Parent->Prev)
+            {
+                Result.Next = Parent->Prev;
+                break;
+            }
+        }
+    }
+    return Result;
+}
+
+void UIDockNodeDockTabView(ui_dock_node *Node, ui_view *View)
+{
+    Assert(!((Node->Flags & UI_DOCK_NODE_FLAGS_ONE_TAB) && (Node->Tabs.TabViewCount > 0)));
+    Assert(!((Node->Flags & UI_DOCK_NODE_FLAGS_ONE_TAB) && (View->Kind != UI_VIEW_KIND_FIXED)));
+    DLLPushFront(Node->Tabs.FirstTabView, Node->Tabs.LastTabView, View);
+    ++Node->Tabs.TabViewCount;
+    Node->Tabs.SelectedTabView = View;
+}
+
+void UIDockNodeRemoveTabView(ui_dock_node *Node, ui_view *View)
+{
+    Node->Tabs.SelectedTabView = View->Prev ? View->Prev : View->Next;
+    DLLRemove(Node->Tabs.FirstTabView, Node->Tabs.LastTabView, View);
+    --Node->Tabs.TabViewCount;
+}
+
+void UIDockNodeInsertTabView(ui_dock_node *Node, ui_view *PrevView, ui_view *View)
+{
+    Assert(!((Node->Flags & UI_DOCK_NODE_FLAGS_ONE_TAB) && (Node->Tabs.TabViewCount > 0)));
+    Assert(!((Node->Flags & UI_DOCK_NODE_FLAGS_ONE_TAB) && (View->Kind != UI_VIEW_KIND_FIXED)));
+    DLLInsert(Node->Tabs.FirstTabView, Node->Tabs.LastTabView, PrevView, View);
+    ++Node->Tabs.TabViewCount;
+    Node->Tabs.SelectedTabView = View;
+}
+
+void UIDockNodeTreeMerge(ui_dock_node *Parent, ui_dock_node *MergeLeadChild)
+{
+    Assert(Parent->First || Parent->First->Next);
+    ui_dock_node *Child0 = Parent->First;
+    ui_dock_node *Child1 = Child0->Next;
+    Assert(MergeLeadChild == Child0 || MergeLeadChild == Child1);
+
+    Parent->AnimatedSize = MergeLeadChild->AnimatedSize;
+    Parent->AnimatedPos = MergeLeadChild->AnimatedPos;
+
+    vec2_f32 BackupLastExplicitSize = Parent->SizeRef;
+    UIDockNodeMoveChildNodes(Parent, MergeLeadChild);
+    if(Child0 && Child0->Tabs.TabViewCount)
+        UIDockNodeMoveTabs(Parent, Child0);
+    if(Child1 && Child1->Tabs.TabViewCount)
+        UIDockNodeMoveTabs(Parent, Child1);
+    Parent->SizeRef = BackupLastExplicitSize;
+
+    Parent->Flags |= Child0->Flags | Child1->Flags;
+
+    if(Child0) UIDockBuilderFreeNode(Child0);
+    if(Child1) UIDockBuilderFreeNode(Child1);
+}
+
+void UIDockingRemoveNode(ui_dock_node *Node, B8 MergeSiblingIntoParent)
+{
+    Assert(Node->First == 0 && Node->Last == 0);
+
+    ui_dock_node *Parent = Node->Parent;
+    B8 Merge = MergeSiblingIntoParent && Parent;
+    if(Merge)
+    {
+        Assert(Parent->First == Node || Parent->First->Next == Node);
+        ui_dock_node *SiblingNode = Parent->First == Node ? Parent->First->Next : Parent->First;
+        UIDockNodeTreeMerge(Parent, SiblingNode);
+
+        if(Parent && Parent->Kind == UI_DOCK_NODE_KIND_GLOBAL && Parent->First && Parent->First->Next)
+        {
+            axis2 Axis = Parent->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT ||
+                Parent->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_RIGHT ? 0 : 1;
+            if(Parent->SplitAxis == Axis)
+            {
+                U32 LeadingChild = (Parent->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT ||
+                                    Parent->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_UP) ? 1 : 0;
+                ui_dock_node *Child0 = LeadingChild ? Parent->First : Parent->Last;
+                ui_dock_node *Child1 = LeadingChild ? Parent->Last : Parent->First;
+                
+                ui_dock_node *First = Parent; while(First->Prev) First = First->Prev;
+                ui_dock_node *Last = Parent; while(Last->Next) Last = Last->Next;                
+
+                ui_dock_node *Children[] = {Child1, Child0};
+                for(U32 ChildIdx = 0; ChildIdx < ArrayCount(Children); ++ChildIdx)
+                {
+                    ui_dock_node *Child = Children[ChildIdx];
+                    Child->Next = Child->Prev = Child->Parent = 0;
+                    Child->Kind = UI_DOCK_NODE_KIND_GLOBAL;
+                    Child->GlobalSplitDir = Parent->GlobalSplitDir;
+                    MemoryZero(&Child->SizeRef, sizeof(Child->SizeRef));
+                    
+                    if(Parent->Parent) DLLInsert(Parent->Parent->First, Parent->Parent->Last, Parent, Child);
+                    else DLLInsert(First, Last, Parent, Child);
+                }
+
+                if(Parent->Parent) DLLRemove(Parent->Parent->First, Parent->Parent->Last, Parent);
+                else DLLRemove(First, Last, Parent);
+                UIDockBuilderFreeNode(Parent);
+            }
+        }
+    }
+    else
+    {
+        if(Parent)
+            DLLRemove(Parent->First, Parent->Last, Node);
+        else
+        {
+            ui_dock_node *First = Node; while(First->Prev) First = First->Prev;
+            ui_dock_node *Last = Node; while(Last->Next) Last = Last->Next;
+            DLLRemove(First, Last, Node);
+        }
+        
+        UIDockBuilderFreeNode(Node);
+    }
+}
+
+B8 UIDockingIsCentralNodeChild(ui_dock_node *Node)
+{
+    while(Node->Parent) Node = Node->Parent;
+    return (Node->Kind == UI_DOCK_NODE_KIND_CENTRAL);
+}

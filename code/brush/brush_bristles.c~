@@ -1,0 +1,374 @@
+/*  =======================================================================
+    File: brush_bristles.c
+    Date: July 27th 2024  9:38 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+
+#define BR_MAX_BRISTLE_SEGMENTS 32
+
+typedef struct br_bishop_frame br_bishop_frame;
+struct br_bishop_frame
+{
+    vec3_f32 u;
+    vec3_f32 v;
+
+    vec3_f32 Darboux;
+};
+
+typedef struct br_material_frame br_material_frame;
+struct br_material_frame
+{
+    vec3_f32 m1;
+    vec3_f32 m2;
+};
+
+typedef struct br_bristle br_bristle;
+struct br_bristle
+{
+    // NOTE: The segments are considered to be of the same size and inextensible. Changing this functionality would require
+    //       changing many of the functions below to work with varying segment lengths.
+    F32 SegmentLength;
+    
+    U32 Count;
+    F32 Beta;
+    F32 Alpha;
+    mat2x2_f32 B;
+    vec3_f32 u0;
+    
+    vec3_f32 Node[BR_MAX_BRISTLE_SEGMENTS];
+    vec3_f32 Edge[BR_MAX_BRISTLE_SEGMENTS - 1];
+    br_bishop_frame Bishop[BR_MAX_BRISTLE_SEGMENTS - 1];
+    F32 Theta[BR_MAX_BRISTLE_SEGMENTS - 1];
+    br_material_frame Material[BR_MAX_BRISTLE_SEGMENTS - 1];
+};
+
+void BRUpdateEdges(br_bristle *Bristle)
+{
+    for(U32 EdgeIdx = 0; EdgeIdx < Bristle->Count - 1; ++EdgeIdx)
+    {
+        vec3_f32 *Edge = &Bristle->Edge[EdgeIdx];
+        Bristle->Edge[EdgeIdx] = Sub3F32(Bristle->Node[EdgeIdx + 1], Bristle->Node[EdgeIdx]);
+    }
+}
+
+void BRComputeMaterialFrameFromBishop(br_bishop_frame *Bishops, F32 *Thetas, br_material_frame *Materials, U32 Count)
+{
+    for(U32 Index = 0; Index < Count - 1; ++Index)
+    {
+        br_material_frame *Material = &Materials[Index];
+        br_bishop_frame *Bishop = &Bishops[Index];
+
+        F32 CosTheta = CosF32(Thetas[Index]);
+        F32 SinTheta = SinF32(Thetas[Index]);
+        
+        Material->m1 = Add3F32(Mul3F32(Bishop->u, Vec3F32(CosTheta, CosTheta, CosTheta)), Mul3F32(Bishop->v, Vec3F32(SinTheta, SinTheta, SinTheta)));
+        Material->m2 = Add3F32(Mul3F32(Bishop->u, Vec3F32(-SinTheta, -SinTheta, -SinTheta)), Mul3F32(Bishop->v, Vec3F32(CosTheta, CosTheta, CosTheta)));
+    }
+}
+
+F32 BRComputeEnergy(br_bristle *Bristle, F32 *Theta, br_material_frame *Material)
+{
+    F32 Energy = 0.0f;
+    for(U32 Index = 1; Index < Bristle->Count - 1; ++Index)
+    {
+        // Bend energy term
+        vec2_f32 W;
+        W = Vec2F32(Dot3F32(Bristle->Bishop[Index].Darboux, Material[Index - 1].m2),
+                    -Dot3F32(Bristle->Bishop[Index].Darboux, Material[Index - 1].m1));
+        Energy += Dot2F32(W, Div2F32(Mul2F32(Mul2F32By2x2F32(Bristle->B, W), Vec2F32(0.5f, 0.5f)),
+                                     Vec2F32(Bristle->SegmentLength, Bristle->SegmentLength)));
+
+        W = Vec2F32(Dot3F32(Bristle->Bishop[Index].Darboux, Material[Index].m2),
+                    -Dot3F32(Bristle->Bishop[Index].Darboux, Material[Index].m1));
+        Energy += Dot2F32(W, Div2F32(Mul2F32(Mul2F32By2x2F32(Bristle->B, W), Vec2F32(0.5f, 0.5f)),
+                                     Vec2F32(Bristle->SegmentLength, Bristle->SegmentLength)));
+        
+        // Twist energy term
+        F32 mi = Theta[Index] - Theta[Index - 1];
+        Energy += Bristle->Beta * mi * mi / Bristle->SegmentLength;
+    }
+
+    return Energy;
+}
+
+F32 BRTwistEnergiesComputeFunctionAndGradient(F32 *Vector, F32 *Gradient, U32 VectorSize, void *UserData)
+{
+    br_bristle *Bristle = (br_bristle *)UserData;
+
+    br_material_frame Material[BR_MAX_BRISTLE_SEGMENTS - 1];
+    BRComputeMaterialFrameFromBishop(Bristle->Bishop, Vector, Material, Bristle->Count);
+
+    // Compute twist energy gradient:
+    mat2x2_f32 JB = Mul2x2F32(Rotate2x2F32(0.25f), Bristle->B);
+    for(U32 Index = 0; Index < Bristle->Count - 1; ++Index)
+    {
+        // Compute first term dWj/dQj + 2 * Beta * mj/lj
+        if(Index > 0)
+        {
+            vec2_f32 W = Vec2F32(Dot3F32(Bristle->Bishop[Index].Darboux, Material[Index].m2),
+                                 -Dot3F32(Bristle->Bishop[Index].Darboux, Material[Index].m1));
+        
+            F32 Term = Dot2F32(W, Mul2F32By2x2F32(JB, W));
+            Term += 2 * Bristle->Beta * (Vector[Index] - Vector[Index - 1]);
+            Term /= Bristle->SegmentLength;
+
+            Gradient[Index] += Term;
+        }
+
+        // Compute second term dWj+1/dQj - 2 * Beta * mj+1/lj+1
+        if(Index < Bristle->Count - 2)
+        {
+            vec2_f32 W = Vec2F32(Dot3F32(Bristle->Bishop[Index + 1].Darboux, Material[Index].m2),
+                                 -Dot3F32(Bristle->Bishop[Index + 1].Darboux, Material[Index].m1));
+
+            F32 Term = Dot2F32(W, Mul2F32By2x2F32(JB, W));
+            Term -= 2 * Bristle->Beta * (Vector[Index + 1] - Vector[Index]);
+            Term /= Bristle->SegmentLength;
+
+            Gradient[Index] += Term;
+        }
+    }
+
+    // Compute energy function
+    return BRComputeEnergy(Bristle, Vector, Material);
+}
+
+void BRComputeDarbouxGradient(br_bristle *Bristle, mat3x3_f32 *DarbouxGrad)
+{
+    mat3x3_f32 PrevDarbouxGrad[BR_MAX_BRISTLE_SEGMENTS - 1];
+    mat3x3_f32 NextDarbouxGrad[BR_MAX_BRISTLE_SEGMENTS - 1];
+    
+    for(U32 Index = 1; Index < Bristle->Count - 1; ++Index)
+    {
+        mat3x3_f32 Skew = {0};
+        Skew.V[0][1] =  2.0f * Bristle->Edge[Index].Z;
+        Skew.V[0][2] = -2.0f * Bristle->Edge[Index].Y;
+        Skew.V[1][0] = -2.0f * Bristle->Edge[Index].Z;
+        Skew.V[1][2] =  2.0f * Bristle->Edge[Index].X;
+        Skew.V[2][0] =  2.0f * Bristle->Edge[Index].Y;
+        Skew.V[2][1] = -2.0f * Bristle->Edge[Index].X;
+        mat3x3_f32 Outer = Outer3F32(Bristle->Bishop[Index].Darboux, Bristle->Edge[Index]);
+
+        F32 Denominator = Bristle->SegmentLength * Bristle->SegmentLength + Dot3F32(Bristle->Edge[Index - 1], Bristle->Edge[Index]);
+        
+        for(U32 j = 0; j < 3; ++j)
+        {
+            for(U32 i = 0; i < 3; ++i)
+                PrevDarbouxGrad[Index].V[i][j] = (Outer.V[i][j] + Skew.V[i][j]) / Denominator;
+        }
+    }
+
+    for(U32 Index = 1; Index < Bristle->Count - 1; ++Index)
+    {
+        mat3x3_f32 Skew = {0};
+        Skew.V[0][1] =  2.0f * Bristle->Edge[Index - 1].Z;
+        Skew.V[0][2] = -2.0f * Bristle->Edge[Index - 1].Y;
+        Skew.V[1][0] = -2.0f * Bristle->Edge[Index - 1].Z;
+        Skew.V[1][2] =  2.0f * Bristle->Edge[Index - 1].X;
+        Skew.V[2][0] =  2.0f * Bristle->Edge[Index - 1].Y;
+        Skew.V[2][1] = -2.0f * Bristle->Edge[Index - 1].X;
+        mat3x3_f32 Outer = Outer3F32(Bristle->Bishop[Index].Darboux, Bristle->Edge[Index - 1]);
+
+        F32 Denominator = Bristle->SegmentLength * Bristle->SegmentLength + Dot3F32(Bristle->Edge[Index - 1], Bristle->Edge[Index]);
+        
+        for(U32 j = 0; j < 3; ++j)
+        {
+            for(U32 i = 0; i < 3; ++i)
+                NextDarbouxGrad[Index].V[i][j] = (Outer.V[i][j] + Skew.V[i][j]) / Denominator;
+        }
+    }
+
+    for(U32 Index = 1; Index < Bristle->Count - 1; ++Index)
+    {
+        for(U32 j = 0; j < 3; ++j)
+        {
+            for(U32 i = 0; i < 3; ++i)
+                DarbouxGrad[Index].V[i][j] = -(PrevDarbouxGrad[Index].V[i][j] + NextDarbouxGrad[Index].V[i][j]);
+        }
+    }
+}
+
+void BRComputeHolonomyGradient(br_bristle *Bristle, vec3_f32 *HolonomyGrad)
+{
+    vec3_f32 PrevHolonomyGrad[BR_MAX_BRISTLE_SEGMENTS - 1];
+    vec3_f32 NextHolonomyGrad[BR_MAX_BRISTLE_SEGMENTS - 1];
+
+    for(U32 Index = 1; Index < Bristle->Count - 1; ++Index)
+    {
+        F32 Denominator = 2.0f * Bristle->SegmentLength;
+        PrevHolonomyGrad[Index] = Div3F32(Bristle->Bishop[Index].Darboux, Vec3F32(Denominator, Denominator, Denominator));
+    }
+
+    for(U32 Index = 1; Index < Bristle->Count - 1; ++Index)
+        NextHolonomyGrad[Index] = Mul3F32(PrevHolonomyGrad[Index], Vec3F32(-1.0f, -1.0f, -1.0f));
+
+    for(U32 Index = 1; Index < Bristle->Count - 1; ++Index)
+        HolonomyGrad[Index] = Mul3F32(Add3F32(PrevHolonomyGrad[Index], NextHolonomyGrad[Index]), Vec3F32(-1.0f, -1.0f, -1.0f));
+}
+
+void BRComputeEnergyGradient(br_bristle *Bristle, vec3_f32 *EnergyGrad)
+{
+    mat3x3_f32 DarbouxGrad[BR_MAX_BRISTLE_SEGMENTS - 1];
+    BRComputeDarbouxGradient(Bristle, DarbouxGrad);
+
+    vec3_f32 HolonomyGrad[BR_MAX_BRISTLE_SEGMENTS - 1];
+    BRComputeHolonomyGradient(Bristle, HolonomyGrad);
+    
+    for(U32 Index = 0; Index < Bristle->Count - 1; ++Index)
+    {
+        F32 FirstScalar = (-2.0f * Bristle->Alpha) / Bristle->SegmentLength;
+        vec3_f32 First = Mul3F32(Mul3F32By3x3F32(Transpose3x3F32(DarbouxGrad[Max(Index, 1)]), Bristle->Bishop[Max(Index, 1)].Darboux),
+                                 Vec3F32(FirstScalar, FirstScalar, FirstScalar));
+        F32 SecondScalar = (Bristle->Beta * (Bristle->Theta[Index] - Bristle->Theta[0])) / (Bristle->SegmentLength * Bristle->Count / 2.0f);
+        vec3_f32 Second = Mul3F32(HolonomyGrad[Max(Index, 1)], Vec3F32(SecondScalar, SecondScalar, SecondScalar));
+
+        EnergyGrad[Index] = Add3F32(First, Second);
+    }
+}
+
+void BRComputeEdgeGradient(br_bristle *Bristle, mat3x3_f32 *EdgeGrad)
+{
+}
+
+void BRComputeDarbouxHessian(br_bristle *Bristle, mat3x3_f32 *DarbouxHessian[3])
+{
+    mat3x3_f32 PrevDarbouxHessian[BR_MAX_BRISTLE_SEGMENTS - 1][3];
+    mat3x3_f32 NextDarbouxHessian[BR_MAX_BRISTLE_SEGMENTS - 1][3];
+
+    // NOTE: X: 0 Y: 1 Z: 2
+    mat3x3_f32 SkewTensor[3] = {0};
+    SkewTensor[0].V[1][2] =  2.0f;
+    SkewTensor[0].V[2][1] = -2.0f;
+    SkewTensor[1].V[0][2] = -2.0f;
+    SkewTensor[1].V[2][0] =  2.0f;
+    SkewTensor[2].V[0][1] =  2.0f;
+    SkewTensor[2].V[1][0] = -2.0f;
+
+    mat3x3_f32 DarbouxGrad[BR_MAX_BRISTLE_SEGMENTS - 1];
+    BRComputeDarbouxGradient(Bristle, DarbouxGrad);
+
+    mat3x3_f32 EdgeGrad[BR_MAX_BRISTLE_SEGMENTS - 1];
+    BRComputeEdgeGradient(Bristle, EdgeGrad);
+    for(U32 Grad = 0; Grad < BR_MAX_BRISTLE_SEGMENTS - 1; ++Grad)
+        EdgeGrad[Grad] = Transpose3x3F32(EdgeGrad[Grad]);
+    
+    for(U32 Index = 1; Index < Bristle->Count - 1; ++Index)
+    {
+        mat3x3_f32 NumeratorDeriv[3] = {0};
+        {
+            mat3x3_f32 DarbouxResult[3] = {0};
+            for(U32 k = 0; k < 3; ++k)
+            {
+                for(U32 j = 0; j < 3; ++j)
+                {
+                    for(U32 i = 0; i < 3; ++i)
+                        DarbouxResult[k].V[i][j] = DarbouxGrad[Index].V[i][j] * Bristle->Edge[Index].V[j];
+                }
+            }
+
+            mat3x3_f32 EdgeResult[3] = {0};
+            for(U32 k = 0; k < 3; ++k)
+            {
+                for(U32 j = 0; j < 3; ++j)
+                {
+                    for(U32 i = 0; i < 3; ++i)
+                        EdgeResult[k].V[i][j] = Bristle->Bishop[Index].Darboux.V[i] * EdgeGrad[Index].V[i][j];
+                }
+            }
+
+            for(U32 k = 0; k < 3; ++k)
+            {
+                for(U32 j = 0; j < 3; ++j)
+                {
+                    for(U32 i = 0; i < 3; ++i)
+                        NumeratorDeriv[k].V[i][j] = SkewTensor[k].V[i][j] + DarbouxResult[k].V[i][j] + EdgeResult[k].V[i][j];
+                }
+            }
+        }
+    }
+}
+
+void BRComputeEnergyHessian(br_bristle *Bristle, mat3x3_f32 *EnergyHessian[3])
+{
+    mat3x3_f32 DarbouxHessian[BR_MAX_BRISTLE_SEGMENTS - 1][3];
+    BRComputeDarbouxHessian(Bristle, DarbouxHessian);
+}
+
+void BRUpdateBishop(br_bristle *Bristle)
+{
+    for(U32 Index = 1; Index < Bristle->Count - 1; ++Index)
+    {
+        F32 Denominator = Bristle->SegmentLength * Bristle->SegmentLength + Dot3F32(Bristle->Edge[Index - 1], Bristle->Edge[Index]);
+        Bristle->Bishop[Index].Darboux = Div3F32(Mul3F32(Vec3F32(2.0f, 2.0f, 2.0f), Cross3F32(Bristle->Edge[Index - 1], Bristle->Edge[Index])),
+                                                 Vec3F32(Denominator, Denominator, Denominator));
+    }
+
+    Bristle->Bishop[0].u = Bristle->u0;
+    Bristle->Bishop[0].v = Normalize3F32(Cross3F32(Bristle->Edge[0], Bristle->Bishop[0].u));
+
+    for(U32 Index = 1; Index < Bristle->Count - 1; ++Index)
+    {
+        F32 Magnitude = Dot3F32(Bristle->Bishop[Index].Darboux, Bristle->Bishop[Index].Darboux);
+        F32 CosPhi = SqrtF32(Max(4.0f / (4.0f + Magnitude), 0.0f));
+        F32 SinPhi = SqrtF32(Max(Magnitude / (4.0f + Magnitude), 0.0f));
+        Assert(CosPhi >= 0.0f && CosPhi <= 1.0f);
+        if((1.0f - CosPhi) < F32Epsilon)
+        {
+            Bristle->Bishop[Index].u = Bristle->Bishop[Index - 1].u;
+            Bristle->Bishop[Index].v = Bristle->Bishop[Index - 1].v;
+            continue;
+        }
+
+        quat_f32 q = RealImaginaryQF32(CosPhi, Mul3F32(Vec3F32(SinPhi, SinPhi, SinPhi), Normalize3F32(Bristle->Bishop[Index].Darboux)));
+        quat_f32 p = RealImaginaryQF32(0.0f, Bristle->Bishop[Index - 1].u);
+        p = MulQF32(MulQF32(q, p), ConjugateQF32(q));
+
+        Bristle->Bishop[Index].u = Normalize3F32(Vec3F32(p.X, p.Y, p.Z));
+        Bristle->Bishop[Index].v = Normalize3F32(Cross3F32(Bristle->Edge[Index], Bristle->Bishop[Index].u));
+    }
+}
+
+br_bristle BRBristleInit(F32 SegmentLength, U32 NumSegments)
+{
+    Assert(NumSegments <= BR_MAX_BRISTLE_SEGMENTS);
+    
+    br_bristle Bristle = {0};
+    Bristle.SegmentLength = SegmentLength;
+    Bristle.Count = NumSegments;
+    Bristle.Alpha = 0.3f;
+    Bristle.Beta = 0.3f;
+    Bristle.B = Mat2x2F32(Bristle.Alpha);
+
+    Bristle.u0 = Vec3F32(1.0f, 0.0f, 0.0f);
+    
+    for(U32 Index = 1; Index < NumSegments; ++Index)
+        Bristle.Node[Index] = Add3F32(Bristle.Node[Index - 1], Vec3F32(0.0f, SegmentLength, 0.0f));
+    BRUpdateEdges(&Bristle);
+    
+    BRUpdateBishop(&Bristle);
+    
+    return Bristle;
+}
+
+void BRBristleUpdateElasticForces(br_bristle *Bristle)
+{
+    Bristle->Node[Bristle->Count - 5].X = 1.0f;
+    
+    BRUpdateEdges(Bristle);
+    BRUpdateBishop(Bristle);
+    
+    lbfgs_solver_params Solver = InitializeDefaultLBFGSParams();
+    Solver.UserData = (void *)Bristle;
+    F32 TwistEnergy = 0.0f;
+    MinimizeLBFGS(Bristle->Theta, Bristle->Count - 1, &TwistEnergy, BRTwistEnergiesComputeFunctionAndGradient, &Solver);
+    
+    BRComputeMaterialFrameFromBishop(Bristle->Bishop, Bristle->Theta, Bristle->Material, Bristle->Count);
+
+    vec3_f32 Forces[BR_MAX_BRISTLE_SEGMENTS - 1];
+    BRComputeEnergyGradient(Bristle, Forces);
+
+    mat3x3_f32 *EnergyHessian;
+    BRComputeEnergyHessian(Bristle, EnergyHessian);
+
+    Log("Forces!\n");
+}

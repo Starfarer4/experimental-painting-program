@@ -1,0 +1,92 @@
+/*  =======================================================================
+    File: vs_kind_rect.hlsl
+    Date: March 9th 2024  2:25 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+
+cbuffer uniform_buffer : register(b0)
+{
+    float2 Resolution;
+    float2 TexSize;
+    row_major float4x4 TextureSampleChannelMap;
+    row_major float3x3 Transform;
+    float2 TransformScale;
+};
+
+struct vs_input
+{
+    float4 Position : POSITION;
+    float4 TexCoords : TEXCOORDS;
+    float4 Colors[4] : COLORS;
+    float4 CornerRadii : CORNERRAD;
+    float BorderThickness : BORDERTHICKNESS;
+    float Softness : SOFTNESS;
+    float WhiteTextureOverride : WHITEOVERRIDE;
+    uint VertexID : SV_VERTEXID;
+};
+
+struct ps_input
+{
+    float2 TexCoord : TEXCOORD;
+    float4 Color : COLOR;
+    float CornerRadius : CORNERRAD;
+    float2 SDFSamplePos : SDFSAMPLEPOS;
+    nointerpolation float2 HalfSize : HALFSIZE;
+    nointerpolation float BorderThickness : BORDERTHICKNESS;
+    nointerpolation float Softness : SOFTNESS;
+    nointerpolation float WhiteTextureOverride : WHITEOVERRIDE;
+    float4 Position : SV_POSITION;
+};
+
+ps_input main(vs_input Input)
+{
+    float2 TopLeftPos = float2(Input.Position.x, Input.Position.y);
+    float2 BottomRightPos = float2(Input.Position.z, Input.Position.w);
+    float2 TopLeftTex = float2(Input.TexCoords.x, Input.TexCoords.y);
+    float2 BottomRightTex = float2(Input.TexCoords.z, Input.TexCoords.w);
+    
+    float2 DstSize = abs(BottomRightPos - TopLeftPos);
+
+    float2 DstVertices[] =
+    {
+        float2(TopLeftPos.x, BottomRightPos.y),
+        float2(TopLeftPos.x, TopLeftPos.y),
+        float2(BottomRightPos.x, BottomRightPos.y),
+        float2(BottomRightPos.x, TopLeftPos.y),
+    };
+
+    float2 SrcVertices[] =
+    {
+        float2(TopLeftTex.x, BottomRightTex.y),
+        float2(TopLeftTex.x, TopLeftTex.y),
+        float2(BottomRightTex.x, BottomRightTex.y),
+        float2(BottomRightTex.x, TopLeftTex.y),
+    };
+
+    float DstRadiusVertex[] =
+    {
+        Input.CornerRadii.y,
+        Input.CornerRadii.x,
+        Input.CornerRadii.w,
+        Input.CornerRadii.z,
+    };
+    
+    float2 DstVertsPct = float2((Input.VertexID >> 1) ? 1 : 0,
+                                (Input.VertexID & 1) ? 0 : 1);
+
+    float2 TransformedPos = mul(Transform, float3(DstVertices[Input.VertexID], 1)).xy;
+    TransformedPos.y = Resolution.y - TransformedPos.y;
+
+    ps_input Output;
+    Output.Position.xy = 2 * TransformedPos / Resolution - 1;
+    Output.Position.zw = float2(0, 1);
+    Output.HalfSize = DstSize / 2 * TransformScale;
+    Output.TexCoord = SrcVertices[Input.VertexID] / TexSize;
+    Output.SDFSamplePos = (2 * DstVertsPct - 1) * Output.HalfSize;
+    Output.Color = Input.Colors[Input.VertexID];
+    Output.CornerRadius = DstRadiusVertex[Input.VertexID];
+    Output.BorderThickness = Input.BorderThickness;
+    Output.Softness = Input.Softness;
+    Output.WhiteTextureOverride = Input.WhiteTextureOverride;    
+    return Output;
+}

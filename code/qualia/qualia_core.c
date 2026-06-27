@@ -1,0 +1,193 @@
+/*  =======================================================================
+    File: qualia_core.c
+    Date: March 16th 2024  9:08 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+
+typedef struct gf_core_state gf_core_state;
+struct gf_core_state
+{
+    gf_cmd_list RootCmds;
+
+    gf_painting_state *FirstActivePaintingState;
+    gf_painting_state *LastActivePaintingState;
+    gf_painting_state *FirstFreePaintingState;
+    gf_painting_state *LastFreePaintingState;
+
+    gf_tool_type CurrentTool;
+    gf_tool_type SelectedTool;
+    gf_painting_state *CurrentPaintingState;
+    br_brush CurrentBrush;
+    br_brush *CurrentBrushLoc;
+
+    br_brush_list LoadedBrushes;
+    
+    arena *RootCmdArena;
+    arena *Arena;
+};
+
+global_variable gf_core_state *GFCoreState = 0;
+
+gf_painting_state *GFCoreAllocPaintingState()
+{
+    gf_painting_state *PaintingState = GFCoreState->FirstFreePaintingState;
+    if(PaintingState)
+    {
+        DLLRemove(GFCoreState->FirstFreePaintingState, GFCoreState->LastFreePaintingState, PaintingState);
+        PaintingState->Next = 0;
+        PaintingState->Prev = 0;
+        PaintingState->Canvas = 0;
+    }
+    else
+        PaintingState = PushStruct(GFCoreState->Arena, gf_painting_state);
+    DLLPushFront(GFCoreState->FirstActivePaintingState, GFCoreState->LastActivePaintingState, PaintingState);
+    return PaintingState;
+}
+
+void GFCoreReleasePaintingState(gf_painting_state *PaintingState)
+{
+    if(GFCoreState->CurrentPaintingState == PaintingState) GFCoreState->CurrentPaintingState = 0;
+    IMDeleteImage(&PaintingState->Image);
+    DLLRemove(GFCoreState->FirstActivePaintingState, GFCoreState->LastActivePaintingState, PaintingState);
+    DLLPushFront(GFCoreState->FirstFreePaintingState, GFCoreState->LastFreePaintingState, PaintingState);
+}
+
+gf_painting_state *GFPaintingStateFromView(ui_view *View)
+{
+    gf_painting_state *Result = 0;
+    for(gf_painting_state *State = GFCoreState->FirstActivePaintingState; State; State = State->Next)
+    {
+        if(State->Canvas == View)
+        {
+            Result = State;
+            break;
+        }
+    }
+    return Result;
+}
+
+void GFCoreStartUp()
+{
+    arena *Arena = ArenaAlloc(Megabytes(4));
+    GFCoreState = PushStruct(Arena, gf_core_state);
+    GFCoreState->Arena = Arena;
+    GFCoreState->RootCmdArena = ArenaAlloc(Megabytes(4));
+    GFCoreState->CurrentTool = GFCoreState->SelectedTool = GF_TOOL_TYPE_BRUSH;
+
+    BRStartState();
+    
+    //GFCoreState->CurrentBrush = PushStruct(Arena, br_brush);
+    GFCoreState->CurrentBrush.TipKind = BR_TIP_KIND_COMPUTED;
+    GFCoreState->CurrentBrush.SizePx = 51.0f;
+    GFCoreState->CurrentBrush.SpacingPct = 0.2f;
+    GFCoreState->CurrentBrush.ComputedTip.Roundness = 0.1f;
+    GFCoreState->CurrentBrush.ComputedTip.Angle = 0.0f;
+    GFCoreState->CurrentBrush.ComputedTip.Hardness = 1.0f;
+    GFCoreState->CurrentBrush.ComputedTip.FlipX = 0;
+    GFCoreState->CurrentBrush.ComputedTip.FlipY = 0;
+    
+    // TODO: Put this somewhere else!
+    {        
+        temp_arena Scratch = GetScratch(0, 0);
+        
+        os_handle File = OSFileOpen(OS_ACCESS_FLAG_READ, Str8Lit("C:\\code\\JSN.abr"));
+        os_file_properties FileProperties = OSPropertiesFromFile(File);
+        U8 *Contents = PushArray(Scratch.Arena, U8, FileProperties.Size);
+        OSFileRead(File, 0, FileProperties.Size, Contents);
+        OSFileClose(File);
+        
+        BRLoadFromABR(Arena, Contents, FileProperties.Size, &GFCoreState->LoadedBrushes);
+        
+        ReleaseScratch(Scratch);
+    }
+}
+
+void GFCoreBeginFrame(gf_cmd_list *Commands)
+{
+    // Process "hot" hotkeys that determines the current tool
+    if(!OSGetKey(OS_KEY_LEFT_MOUSE_BUTTON))
+    {
+        if(OSGetKeyFlags(OS_KEY_SPACE, OS_EVENT_FLAG_CTRL)) GFCoreState->CurrentTool = GF_TOOL_TYPE_ZOOM;
+        else if(OSGetKeyFlags(OS_KEY_SPACE, 0))             GFCoreState->CurrentTool = GF_TOOL_TYPE_MOVE;
+        else if(OSGetKeyFlags(OS_KEY_R, 0))                 GFCoreState->CurrentTool = GF_TOOL_TYPE_ROTATE;
+        else                                                GFCoreState->CurrentTool = GFCoreState->SelectedTool;
+    }
+    
+    for(gf_cmd_node *CommandNode = Commands->First; CommandNode; CommandNode = CommandNode->Next)
+    {
+        gf_cmd *Command = &CommandNode->Command;
+        gf_cmd_params *Params = Command->Params;
+        switch(Command->Kind)
+        {
+            case GF_CMD_KIND_OPEN:
+            {
+                gf_window *Window = (gf_window *)Params->Window;
+                temp_arena Scratch = GetScratch(0, 0);
+                string8 Path = OSFileOpenDialog(Scratch.Arena, Window->OSWindow);
+                if(Path.Size)
+                {
+                    ui_view *Canvas = GFCreateUIView(GF_VIEW_KIND_CANVAS);
+                    gf_painting_state *PaintingState = GFPaintingStateFromView(Canvas);
+                    im_image_loader_error Error = IMLoadImage(&PaintingState->Image, Path);
+                    
+                    if(Error == IM_IMAGE_LOADER_ERROR_SUCCESS)
+                    {
+                        ui_dock_node *Node = Window->RootDockNode;
+                        while(Node->First) Node = Node->First;
+                        UIDockNodeDockTabView(Node, Canvas);
+                    }
+                    else
+                    {
+                        switch(Error)
+                        {
+                            case IM_IMAGE_LOADER_ERROR_LOADER:
+                                OSMessageBox(Str8Lit("Loader initialization error!"), Str8Lit("Failed to initialize the image loader."),
+                                             OS_MESSAGE_BOX_TYPE_ERROR, Window->OSWindow);
+                                break;
+                            case IM_IMAGE_LOADER_ERROR_CODEC_NOT_FOUND:
+                                OSMessageBox(Str8Lit("Codec not found!"), Str8Lit("This image type is unsupported by this machine."),
+                                             OS_MESSAGE_BOX_TYPE_ERROR, Window->OSWindow);
+                                break;
+                            case IM_IMAGE_LOADER_ERROR_UNKNOWN:
+                                OSMessageBox(Str8Lit("Image loader error!"), Str8Lit("This image cannot be loaded."),
+                                             OS_MESSAGE_BOX_TYPE_ERROR, Window->OSWindow);
+                                break;
+                        }
+                        GFDeleteUIView(Canvas);
+                    }
+                }
+                ReleaseScratch(Scratch);
+            }break;
+        }
+    }
+    
+    ArenaClear(GFCoreState->RootCmdArena);
+    MemoryZero(&GFCoreState->RootCmds, sizeof(gf_cmd_list));
+}
+
+void GFCmdListPush(arena *Arena, gf_cmd_list *Commands, gf_cmd_params *Params, gf_cmd_kind Kind)
+{
+    gf_cmd_node *Node = PushStruct(Arena, gf_cmd_node);
+    if(Params)
+    {
+        gf_cmd_params *ParamsCpy = PushStruct(Arena, gf_cmd_params);
+        MemoryCopy(ParamsCpy, Params, sizeof(gf_cmd_params));
+        Node->Command.Params = ParamsCpy;
+    }
+    Node->Command.Kind = Kind;
+    DLLPushBack(Commands->First, Commands->Last, Node);
+    ++Commands->Count;
+}
+
+void GFPushCmdRoot(gf_cmd_params *Params, gf_cmd_kind Kind)
+{
+    GFCmdListPush(GFCoreState->RootCmdArena, &GFCoreState->RootCmds, Params, Kind);
+}
+
+gf_cmd_list GFGatherRootCmds(arena *Arena)
+{
+    gf_cmd_list Commands = {0};
+    for(gf_cmd_node *Node = GFCoreState->RootCmds.First; Node; Node = Node->Next)
+        GFCmdListPush(Arena, &Commands, Node->Command.Params, Node->Command.Kind);
+    return Commands;
+}

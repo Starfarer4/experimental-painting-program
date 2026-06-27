@@ -1,0 +1,93 @@
+@table(View, ViewCaps, String)
+gf_views_table:
+{
+    {Tools, TOOLS, "Tools"}
+    {Layers, LAYERS, "Layers"}
+    {Canvas, CANVAS, "Canvas"}
+    {BrushSettings, BRUSH_SETTINGS, "Brush Settings"}
+    {BrushLister, BRUSH_LISTER, "Brush Lister"}
+}
+
+@gen_enum gf_view_kind:
+{
+    @expand(gf_views_table a)
+        `GF_VIEW_KIND_$(a.ViewCaps),`;
+    `GF_VIEW_KIND_COUNT`;
+}
+
+@gen_data(`string8`) GFViewNames:
+{
+    @expand(gf_views_table a)
+        `Str8LitComp("$(a.String)"),`;
+}
+
+@gen
+{
+    @expand(gf_views_table a) `UIBuildViewHook(GF$(a.View)BuildView);`
+}
+
+@gen
+{
+    @expand(gf_views_table a) `UIStartUpViewHook(GF$(a.View)StartUpView);`
+}
+
+@gen
+{
+    @expand(gf_views_table a) `UIShutDownViewHook(GF$(a.View)ShutDownView);`
+}
+
+@gen_data(`ui_build_view_hook`) GFBuildHookPtrList:
+{
+    @expand(gf_views_table a)
+        `GF$(a.View)BuildView,`;
+}
+
+@gen_data(`ui_start_up_view_hook`) GFStartUpHookPtrList:
+{
+    @expand(gf_views_table a)
+        `GF$(a.View)StartUpView,`;
+}
+
+@gen_data(`ui_shut_down_view_hook`) GFShutDownHookPtrList:
+{
+    @expand(gf_views_table a)
+        `GF$(a.View)ShutDownView,`;
+}
+
+@gen
+{
+    `#define GFDefineBuildHookPtrList \\`;
+    @expand(gf_views_table a) `GF$(a.View)BuildView, \\`;
+}
+
+@gen
+{
+    `#define GFDefineStartUpHookPtrList \\`;
+    @expand(gf_views_table a) `GF$(a.View)StartUpView, \\`;
+}
+
+@gen
+{
+    `#define GFDefineShutDownHookPtrList \\`;
+    @expand(gf_views_table a) `GF$(a.View)ShutDownView, \\`;
+}
+
+@table(Kind, Name)
+gf_brush_settings_view_table:
+{
+    {TIP_SHAPE, "Brush Tip Shape"}
+    {SHAPE_DYNAMICS, "Shape Dynamics"}
+}
+
+@gen_enum gf_brush_settings_view_kind:
+{
+    @expand(gf_brush_settings_view_table a)
+        `GF_BRUSH_SETTINGS_VIEW_KIND_$(a.Kind),`;
+    `GF_BRUSH_SETTINGS_VIEW_KIND_COUNT`;
+}
+
+@gen_data(`string8`) GFBrushSettingsViewNames:
+{
+    @expand(gf_brush_settings_view_table a)
+        `Str8LitComp("$(a.Name)"),`;
+}

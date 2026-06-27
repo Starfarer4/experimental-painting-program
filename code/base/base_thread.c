@@ -1,0 +1,78 @@
+/*  =======================================================================
+    File: base_thread.c
+    Date: June 29th 2024  3:11 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+
+per_thread thread_context *ThreadContextLocal;
+
+void ThreadContextInitAndEquip(thread_context *Context)
+{
+    MemoryZero(Context, sizeof(thread_context));
+    MathRandSeed(&Context->RandomState, (U32)IntFromPtr(Context));
+    for(U64 Arena = 0; Arena < ArrayCount(Context->Arenas); ++Arena)
+        Context->Arenas[Arena] = ArenaAlloc(Gigabytes(8));
+    ThreadContextLocal = Context;
+}
+
+void ThreadContextRelease()
+{
+    for(U64 Arena = 0; Arena < ArrayCount(ThreadContextLocal->Arenas); ++Arena)
+        ArenaRelease(ThreadContextLocal->Arenas[Arena]);
+}
+
+thread_context *ThreadContextGetEquipped()
+{
+    return ThreadContextLocal;
+}
+
+arena *ThreadContextGetScratch(arena **Conflicts, U64 ConflictCount)
+{
+    arena *Result = 0;
+    arena **ArenaPtr = ThreadContextLocal->Arenas;
+    for(U64 ArenaIter = 0; ArenaIter = ArrayCount(ThreadContextLocal->Arenas); ++ArenaIter, ++ArenaPtr)
+    {
+        arena *Arena = *ArenaPtr;
+        arena **ConflictPtr = Conflicts;
+        for(U32 ConflictIter = 0; ConflictIter < ConflictCount; ++ConflictIter, ++ConflictPtr)
+        {
+            if(Arena == *ConflictPtr)
+            {
+                Arena = 0;
+                break;
+            }
+        }
+        if(Arena != 0)
+        {
+            Result = Arena;
+            break;
+        }
+    }
+    
+    return Result;
+}
+
+void ThreadContextSetThreadName(string8 Name)
+{
+    thread_context *Context = ThreadContextGetEquipped();
+    U64 Size = Min(Name.Size, sizeof(Context->Name));
+    MemoryCopy(Context->Name, Name.String, Size);
+    Context->NameSize = Size;
+}
+
+string8 ThreadContextGetThreadName()
+{
+    thread_context *Context = ThreadContextGetEquipped();
+    string8 Result = Str8(Context->Name, Context->NameSize);
+    return Result;
+}
+
+U32 ThreadContextRandNextU32()
+{
+    return MathRandNextU32(&ThreadContextLocal->RandomState);
+}
+
+F32 ThreadContextRandNextF32()
+{
+    return MathRandNextF32(&ThreadContextLocal->RandomState);
+}

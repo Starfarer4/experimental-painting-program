@@ -1,0 +1,89 @@
+@table(Name, NameLower, Type, Nil)
+ui_stack_table:
+{
+    {Parent parent `ui_box *`, 0}
+    {Flags flags `ui_box_flags`, 0}
+    {Font font `font_handle`, 0}
+    {FontSize font_size `F32`, 0.0f}
+    {PrefWidth pref_width `ui_size`, `{0, 0.0f, 0.0f}`}
+    {PrefHeight pref_height `ui_size`, `{0, 0.0f, 0.0f}`}
+    {TextPadding text_padding `F32`, 0.0f}
+    {TextColor text_color `vec4_f32`, `{1.0f, 1.0f, 1.0f, 1.0f}`}
+    {FixedWidth fixed_width `F32`, 0.0f}
+    {FixedHeight fixed_height `F32`, 0.0f}
+    {FixedX fixed_x `F32`, 0.0f}
+    {FixedY fixed_y `F32`, 0.0f}
+    {BackgroundColor backgrond_color `vec4_f32`, `{0.0f, 0.0f, 0.0f, 0.0f}`}
+    {BorderColor border_color `vec4_f32`, `{0.0f, 0.0f, 0.0f, 0.0f}`}
+    {OverlayColor overlay_color `vec4_f32` `{0.0f, 0.0f, 0.0f, 0.0f}`}
+    {ChildLayoutAxis child_layout_axis `axis2`, 0}
+    {TextAlignment text_alignment `ui_text_alignment_type`, 0}
+    {HoverCursor hover_cursor `os_cursor`, `OS_CURSOR_POINTER`}
+    {CornerRadius0 corner_radius0 `F32`, `0.0f`}
+    {CornerRadius1 corner_radius1 `F32`, `0.0f`}
+    {CornerRadius2 corner_radius2 `F32`, `0.0f`}
+    {CornerRadius3 corner_radius3 `F32`, `0.0f`}
+    {Squish squish `F32`, `0.0f`}
+}
+
+// Declare node types
+@gen
+{
+    @expand(ui_stack_table a) `typedef struct ui_$(a.NameLower)_node ui_$(a.NameLower)_node; struct ui_$(a.NameLower)_node{ui_$(a.NameLower)_node *Next; $(a.Type) Data;};`
+}
+
+// Declare stack types
+@gen
+{
+    @expand(ui_stack_table a) `typedef struct ui_$(a.NameLower)_stack ui_$(a.NameLower)_stack; struct ui_$(a.NameLower)_stack{ui_$(a.NameLower)_node *Top; B8 AutoPop;};`
+}
+
+@gen
+{
+    `#define UIDefineStacks \\`;
+    @expand(ui_stack_table a) `ui_$(a.NameLower)_stack $(a.Name)Stack; \\`;
+}
+
+// Declare node nils
+@gen
+{
+    `#define UIDefineNodeNils \\`;
+    @expand(ui_stack_table a) `global_variable ui_$(a.NameLower)_node Nil$(a.Name)Node = {0, $(a.Nil)}; \\`;
+}
+
+// Clear stacks macro
+@gen
+{
+    `#define UIClearStacks \\`;
+    @expand(ui_stack_table a) `UIState->$(a.Name)Stack.Top = &Nil$(a.Name)Node; UIState->$(a.Name)Stack.AutoPop = 0; \\`;
+}
+
+// Declare stack functions
+@gen
+{
+    @expand(ui_stack_table a) `void UIPush$(a.Name)($(a.Type) $(a.Name));`;
+    @expand(ui_stack_table a) `void UIPop$(a.Name)();`;
+    @expand(ui_stack_table a) `void UISetNext$(a.Name)($(a.Type) $(a.Name));`;
+    @expand(ui_stack_table a) `$(a.Type) UITop$(a.Name)();`;
+}
+
+// Defer loops
+@gen
+{
+    @expand(ui_stack_table a) `#define UI$(a.Name)($(a.Name)) DeferLoop(UIPush$(a.Name)($(a.Name)), UIPop$(a.Name)())`
+}
+
+// Auto pop
+@gen
+{
+    `#define UIAutoPopStacks \\`;
+    @expand(ui_stack_table a) `if(UIState->$(a.Name)Stack.AutoPop) {UIPop$(a.Name)(); UIState->$(a.Name)Stack.AutoPop = 0;} \\`
+}
+
+@gen @c
+{
+    @expand(ui_stack_table a) `void UIPush$(a.Name)($(a.Type) $(a.Name)) {UIStackPushImpl(UIState, ui_$(a.NameLower)_node, $(a.Name)Stack, $(a.Name))}`;
+    @expand(ui_stack_table a) `void UIPop$(a.Name)() {UIStackPopImpl(UIState, $(a.Name)Stack)}`;
+    @expand(ui_stack_table a) `void UISetNext$(a.Name)($(a.Type) $(a.Name)) {UIStackSetNextImpl(UIState, ui_$(a.NameLower)_node, $(a.Name)Stack, $(a.Name))}`;
+    @expand(ui_stack_table a) `$(a.Type) UITop$(a.Name)() {return UIState->$(a.Name)Stack.Top->Data;}`;
+}

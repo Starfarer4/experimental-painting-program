@@ -1,0 +1,1592 @@
+/*  =======================================================================
+   File: qualia_gfx.c
+   Date: March 7th 2024 10:48 PM
+   Creator: Quinn Van De Keere
+   =======================================================================*/
+
+#include "generated/qualia_gfx.meta.c"
+
+typedef enum gf_drag_drop_state
+{
+    GF_DRAG_DROP_STATE_NULL,
+    GF_DRAG_DROP_STATE_DRAGGING,
+    GF_DRAG_DROP_STATE_DROPPING,
+    GF_DRAG_DROP_STATE_COUNT
+}gf_drag_drop_state;
+
+typedef struct gf_drag_drop_payload gf_drag_drop_payload;
+struct gf_drag_drop_payload
+{
+    ui_key Key;
+    ui_dock_node *DockNode;
+    ui_view *View;
+    ui_view *PrevView;
+};
+
+typedef struct gf_state gf_state;
+struct gf_state
+{
+    gf_window *FirstFreeWindow;
+    gf_window *LastFreeWindow;
+    
+    gf_window *FirstActiveWindow;
+    gf_window *LastActiveWindow;
+    
+    arena *FrameArena;
+    arena *Arena;
+    
+    font_handle MainFont;
+    font_handle IconFont;
+    
+    F32 MainFontPoints;
+    
+    gf_drag_drop_state DragDropState;
+    gf_drag_drop_payload DragDropPayload;
+    ui_dock_node *LastDragDropDock;
+    ui_view *LastDragDropPrevTab;
+    
+    vec4_f32 ThemeColors[GF_THEME_COLOR_COUNT];
+    
+    F32 Delta;
+    
+    void (*RepaintHook)(os_handle RepaintWindow);
+};
+
+global_variable gf_state *GFState = 0;
+
+arena *GFGetFrameArena()
+{
+    return GFState->FrameArena;
+}
+
+B8 GFDragIsActive()
+{
+    return ((GFState->DragDropState == GF_DRAG_DROP_STATE_DRAGGING) ||
+            (GFState->DragDropState == GF_DRAG_DROP_STATE_DROPPING));
+}
+
+void GFDragBegin(gf_drag_drop_payload *Payload)
+{
+    if(!GFDragIsActive())
+    {
+        GFState->DragDropState = GF_DRAG_DROP_STATE_DRAGGING;
+        MemoryCopy(&GFState->DragDropPayload, Payload, sizeof(gf_drag_drop_payload));
+    }
+}
+
+B8 GFDragDrop(gf_drag_drop_payload *OutPayload)
+{
+    B8 Result = 0;
+    if(GFState->DragDropState == GF_DRAG_DROP_STATE_DROPPING)
+    {
+        Result = 1;
+        GFState->DragDropState = GF_DRAG_DROP_STATE_NULL;
+        MemoryCopy(OutPayload, &GFState->DragDropPayload, sizeof(gf_drag_drop_payload));
+        MemoryZero(&GFState->DragDropPayload, sizeof(gf_drag_drop_payload));
+    }
+    return Result;
+}
+
+void GFQueueDragDrop()
+{
+    GFState->DragDropState = GF_DRAG_DROP_STATE_DROPPING;
+}
+
+gf_window *GFGetActiveWindows()
+{
+    return GFState->FirstActiveWindow;
+}
+
+gf_window *GFWindowFromOSHandle(os_handle Handle)
+{
+    gf_window *Result = 0;
+    for(gf_window *Window = GFState->FirstActiveWindow; Window; Window = Window->Next)
+    {
+        if(Window->OSWindow == Handle)
+        {
+            Result = Window;
+            break;
+        }
+    }
+    return Result;
+}
+
+F32 GFFontSizeFromPoints(os_handle OSWindow, F32 Points)
+{
+    F32 DPI = OSDPIFromWindow(OSWindow);
+    F32 SizeAt96DPI = Points;
+    F32 Result = DPI * (SizeAt96DPI / 96.0f);
+    return Result;
+}
+
+void GFStartUp(void (*RepaintHook)(os_handle RepaintWindow))
+{
+    arena *Arena = ArenaAlloc(Megabytes(4));
+    GFState = PushStruct(Arena, gf_state);
+    GFState->Arena = Arena;
+    GFState->FrameArena = ArenaAlloc(Megabytes(4));
+    
+    GFState->MainFont = FontOpen(Str8Lit("C:/code/qualia/data/GOTHIC.TTF"));
+    GFState->MainFontPoints = 11.0f;
+    
+    GFState->IconFont = FontOpen(Str8Lit("C:/code/qualia/data/fontello.ttf"));
+    
+    GFState->RepaintHook = RepaintHook;
+    
+    // TODO: Theme manager
+    for(U32 Color = 0; Color < GF_THEME_COLOR_COUNT; ++Color)
+        GFState->ThemeColors[Color] = GFThemePresetColorsDefaultDark[Color];
+    
+    GFPushCmdRoot(0, GF_CMD_KIND_MAKE_MAIN_WINDOW);
+}
+
+gf_window *GFWindowOpen(gf_window *Parent, U32 Width, U32 Height, U32 X, U32 Y)
+{
+    gf_window *Window = 0;
+    
+    if(GFState->FirstFreeWindow)
+    {
+        Window = GFState->FirstFreeWindow;
+        DLLRemove(GFState->FirstFreeWindow, GFState->LastFreeWindow, Window);
+        MemoryZero(Window, sizeof(gf_window));
+    }
+    else
+        Window = PushStruct(GFState->Arena, gf_window);
+    
+    DLLPushFront(GFState->FirstActiveWindow, GFState->LastActiveWindow, Window);
+    
+    Window->OSWindow = OSOpenWindow(Str8Lit("Angelic Painter"), Parent ? Parent->OSWindow : 0, Width, Height, X, Y);
+    OSWindowEquipRepaint(Window->OSWindow, GFState->RepaintHook);
+    Window->RndWindow = RndWindowEquip(Window->OSWindow);
+    Window->UI = UIStateAlloc();
+    Window->UIAnimationState = UIAnimationStateAlloc();
+    Window->LastWindowRect = Rng2F32(Vec2F32(50.0f, 50.0f), Vec2F32(50.0f, 50.0f));
+    Window->Parent = Parent;
+    Window->LastDPI = OSDPIFromWindow(Window->OSWindow);
+    
+    return Window;
+}
+
+void GFBeginFrame(gf_cmd_list *Commands, F32 Delta)
+{
+    ArenaClear(GFState->FrameArena);
+    
+    GFState->Delta = Delta;
+    
+    for(gf_cmd_node *CommandNode = Commands->First; CommandNode; CommandNode = CommandNode->Next)
+    {
+        gf_cmd *Command = &CommandNode->Command;
+        gf_cmd_params *Params = Command->Params;
+        switch(Command->Kind)
+        {
+            case GF_CMD_KIND_WINDOW_DESTROY:
+            {
+                gf_window *Window = (gf_window *)Params->Window;
+                
+                // Free dock nodes and docked views
+                for(ui_dock_node *FirstNode = Window->RootDockNode, *Node = FirstNode; Node;)
+                {
+                    if(!Node->First)
+                    {
+                        for(ui_view *Tab = Node->Tabs.FirstTabView, *NextTab; Tab; Tab = NextTab)
+                        {
+                            NextTab = Tab->Next;
+                            GFDeleteUIView(Tab);
+                        }
+                        
+                        if(Node == FirstNode) FirstNode = Node->Next;
+                        UIDockingRemoveNode(Node, 0);
+                        Node = FirstNode;
+                    }
+                    else
+                        Node = UIGetDockNodeRecursionPre(Node);
+                }
+                
+                UIAnimationStateRelease(Window->UIAnimationState);
+                UIStateRelease(Window->UI);
+                RndWindowUnequip(Window->RndWindow);
+                OSCloseWindow(Window->OSWindow);
+                
+                // Deallocates the window
+                DLLRemove(GFState->FirstActiveWindow, GFState->LastActiveWindow, Window);
+                DLLPushFront(GFState->FirstFreeWindow, GFState->LastFreeWindow, Window);
+            }break;
+            
+            case GF_CMD_KIND_NEW_PANEL_LEFT:
+            case GF_CMD_KIND_NEW_PANEL_RIGHT:
+            case GF_CMD_KIND_NEW_PANEL_UP:
+            case GF_CMD_KIND_NEW_PANEL_DOWN:
+            {
+                ui_dockspace_split_dir SplitDir = Command->Kind - GF_CMD_KIND_NEW_PANEL_LEFT;
+                
+                ui_dock_node *SrcDock = Params->Dock;
+                ui_view *View = Params->View;
+                F32 DockSize = Params->Size;
+                
+                UIDockNodeRemoveTabView(SrcDock, View);
+                
+                B8 SplitAsLocal = View->Kind == UI_VIEW_KIND_CONTENT;
+                
+                ui_dock_node *SplitDock = Params->DestDock;
+                ui_dock_node *NewDock = UIDockBuilderSplitNode(SplitDock, SplitDir, DockSize, 0, 0, SrcDock->Flags, SplitAsLocal);
+                
+                UIDockNodeDockTabView(NewDock, View);
+
+                if(View->Kind == UI_VIEW_KIND_CONTENT)
+                    GFCoreState->CurrentPaintingState = GFPaintingStateFromView(View);
+                // notify mutation
+            }break;
+            
+            case GF_CMD_KIND_MOVE_TAB:
+            {
+                ui_dock_node *SrcDock = Params->Dock;
+                ui_view *View = Params->View;
+                ui_dock_node *DestDock = Params->DestDock;
+                ui_view *PrevView = Params->PrevView;
+                if(SrcDock && DestDock && PrevView != View)
+                {
+                    UIDockNodeRemoveTabView(SrcDock, View);
+                    UIDockNodeInsertTabView(DestDock, PrevView, View);
+
+                    if(View->Kind == UI_VIEW_KIND_CONTENT)
+                        GFCoreState->CurrentPaintingState = GFPaintingStateFromView(View);
+                    // notify mutation
+                }
+            }break;
+            
+            case GF_CMD_KIND_CLOSE_TAB:
+            {
+                ui_dock_node *Dock = Params->Dock;
+                ui_view *View = Params->View;
+                UIDockNodeRemoveTabView(Dock, View);
+                GFDeleteUIView(View);
+                // notify mutation
+            }break;
+            
+            case GF_CMD_KIND_MAKE_MAIN_WINDOW:
+            {
+                gf_window *Window = GFWindowOpen(0, 1920, 1080, 100, 100);
+                
+                ui_dock_node *Central = UIDockBuilderCreateNode(UI_DOCK_NODE_KIND_CENTRAL, 0,
+                                                                Rng2F32(Vec2F32(0.0f, 0.0f), Vec2F32(1920.0f, 1080.0f)));
+                ui_dock_node *Tools = UIDockBuilderSplitNode(Central, UI_DOCKSPACE_SPLIT_DIR_LEFT, 40.0f, 0, &Central,
+                                                             UI_DOCK_NODE_FLAGS_FIXED_SIZE_X | UI_DOCK_NODE_FLAGS_ONE_TAB, 0);
+                ui_dock_node *ToolProperties = UIDockBuilderSplitNode(Central, UI_DOCKSPACE_SPLIT_DIR_UP, 40.0f, 0, &Central,
+                                                                      UI_DOCK_NODE_FLAGS_FIXED_SIZE_Y | UI_DOCK_NODE_FLAGS_ONE_TAB, 0);
+                
+                
+                ui_dock_node *Layers = UIDockBuilderSplitNode(Central, UI_DOCKSPACE_SPLIT_DIR_RIGHT, 250.0f, 0, &Central, 0, 0);
+                
+                ui_dock_node *FarLayers = UIDockBuilderSplitNode(Central, UI_DOCKSPACE_SPLIT_DIR_RIGHT, 250.0f, 0, &Central, 0, 0);
+                
+                ui_dock_node *AnotherTools = UIDockBuilderSplitNode(Layers, UI_DOCKSPACE_SPLIT_DIR_DOWN, 0.6f, 0, &Layers, 0, 0);
+                ui_dock_node *AnotherToolsTools = UIDockBuilderSplitNode(Layers, UI_DOCKSPACE_SPLIT_DIR_RIGHT, 0.5f, 0, &Layers, 0, 0);
+                
+                ui_view *ToolsView = GFCreateUIView(GF_VIEW_KIND_TOOLS);
+                ui_view *ToolPropertiesView = GFCreateUIView(GF_VIEW_KIND_LAYERS); ToolPropertiesView->Kind = UI_VIEW_KIND_FIXED;
+                ui_view *LayersView = GFCreateUIView(GF_VIEW_KIND_LAYERS);
+                ui_view *LayersViewAgain = GFCreateUIView(GF_VIEW_KIND_LAYERS);
+                ui_view *FarLayersView = GFCreateUIView(GF_VIEW_KIND_BRUSH_SETTINGS);
+                ui_view *BrushListerView = GFCreateUIView(GF_VIEW_KIND_BRUSH_LISTER);
+                ui_view *AnotherToolsView = GFCreateUIView(GF_VIEW_KIND_LAYERS);
+                
+                UIDockNodeDockTabView(Tools, ToolsView);
+                UIDockNodeDockTabView(ToolProperties, ToolPropertiesView);
+                
+                UIDockNodeDockTabView(Layers, LayersView);
+                UIDockNodeDockTabView(AnotherToolsTools, LayersViewAgain);
+                
+                UIDockNodeDockTabView(FarLayers, BrushListerView);
+                UIDockNodeDockTabView(FarLayers, FarLayersView);
+                UIDockNodeDockTabView(AnotherTools, AnotherToolsView);
+                
+                Window->RootDockNode = Central;
+            }break;
+        }
+    }
+}
+
+void GFEndFrame()
+{
+    if(GFState->DragDropState == GF_DRAG_DROP_STATE_DROPPING)
+    {
+        GFState->DragDropState = GF_DRAG_DROP_STATE_NULL;
+        MemoryZero(&GFState->DragDropPayload, sizeof(gf_drag_drop_payload));
+    }
+}
+
+ui_signal GFMakeTopBarButton(string8 String)
+{
+    ui_box *Box = UIMakeBoxFromString(UI_BOX_FLAG_DRAW_TEXT | UI_BOX_FLAG_DRAW_BORDER | UI_BOX_FLAG_DRAW_BACKGROUND |
+                                      UI_BOX_FLAG_CLICKABLE | UI_BOX_FLAG_DRAW_HOT_EFFECTS | UI_BOX_FLAG_DRAW_ACTIVE_EFFECTS, String);
+    ui_signal Signal = UISignalFromBox(Box);
+    return Signal;
+}
+
+ui_signal GFMakeCmdButton(string8 DisplayText)
+{
+    ui_box *Box = UIMakeBoxFromStringFmt(UI_BOX_FLAG_DRAW_BORDER | UI_BOX_FLAG_DRAW_BACKGROUND | UI_BOX_FLAG_DRAW_HOT_EFFECTS |
+                                         UI_BOX_FLAG_DRAW_ACTIVE_EFFECTS | UI_BOX_FLAG_CLICKABLE,
+                                         Str8Lit("###Cmd_%S"), Str8VArg(DisplayText));
+    
+    UIParent(Box)
+    {
+        UISetNextTextPadding(4.0f);
+        UILabel(DisplayText);
+    }
+    
+    ui_signal Signal = UISignalFromBox(Box);
+    return Signal;
+}
+
+void GFWindowUpdateAndRender(gf_window *Window, os_event_list *Events)
+{
+    B8 WindowIsFocused = OSWindowIsFocused(Window->OSWindow);
+    
+    // Begin UI build with initial stack values
+    UISelectState(Window->UI);
+    UIBeginBuild(Events, Window->OSWindow, GFState->IconFont, GFState->Delta);
+    UIPushFont(GFState->MainFont);
+    UIPushFontSize(GFFontSizeFromPoints(Window->OSWindow, GFState->MainFontPoints));
+    UIPushPrefWidth(UIEM(20.0f, 1.0f));
+    UIPushPrefHeight(UIEM(2.0f, 1.0f));
+    UIPushBackgroundColor(GFRGBAFromThemeColor(GF_THEME_COLOR_PLAIN_BACKGROUND));
+    UIPushTextColor(GFRGBAFromThemeColor(GF_THEME_COLOR_PLAIN_TEXT));
+    UIPushBorderColor(GFRGBAFromThemeColor(GF_THEME_COLOR_PLAIN_BORDER));
+    
+    rng2_f32 WindowRect = OSClientRectFromWindow(Window->OSWindow);    
+    vec2_f32 WindowRectDim = Dim2F32(WindowRect);
+    rng2_f32 TopBarRect = Rng2F32(WindowRect.TopLeft, Window->Parent ? Vec2F32(WindowRect.Right, WindowRect.Top) :
+                                  Vec2F32(WindowRect.Right, WindowRect.Top + UITopPrefHeight().Value));
+    rng2_f32 ContentRect = Rng2F32(Vec2F32(WindowRect.Left, TopBarRect.Bottom), WindowRect.BottomRight);
+    
+    B8 IsWindowResizing = (Window->LastWindowRect.Left != WindowRect.Left || Window->LastWindowRect.Right != WindowRect.Right ||
+                           Window->LastWindowRect.Top != WindowRect.Top || Window->LastWindowRect.Bottom != WindowRect.Bottom);
+    
+    UISelectAnimationState(Window->UIAnimationState);
+    UIBeginAnimation(GFState->Delta);
+    
+    // Drag/drop visualization tooltips
+    B8 DragActive = GFDragIsActive();
+    if(DragActive && WindowIsFocused)
+    {
+        gf_drag_drop_payload *Payload = &GFState->DragDropPayload;
+        ui_dock_node *DockNode = Payload->DockNode;
+        ui_view *View = Payload->View;
+        UITooltip
+        {
+            ui_box *Tooltip = UITopParent();
+            if(View)
+            {
+                UISetNextPrefWidth(UIChildrenSum(1.0f));
+                UIRow UIHeightFill
+                {
+                    string8 DisplayName = View->Name;
+                    UILabel(DisplayName);
+                    Tooltip->BackgroundColor = GFRGBAFromThemeColor(GF_THEME_COLOR_TAB_ACTIVE);
+                }
+            }
+        }
+    }
+    
+    if(Window->Parent == 0)
+    {
+        // Build the top bar
+        UIBackgroundColor(GFRGBAFromThemeColor(GF_THEME_COLOR_ALT_BACKGROUND))
+            UITextColor(GFRGBAFromThemeColor(GF_THEME_COLOR_ALT_TEXT))
+            UIBorderColor(GFRGBAFromThemeColor(GF_THEME_COLOR_ALT_BORDER))
+            UIPane(TopBarRect, Str8Lit("###TopBar"))
+            UIWidthFill UIRow
+        {
+            // Menu items
+            UISetNextFlags(UI_BOX_FLAG_DRAW_BACKGROUND);
+            UIPrefWidth(UIChildrenSum(1.0f)) UIRow UIPrefWidth(UITextDim(2.0f * UITopFontSize(), 1.0f))
+            {
+                //File menu
+                ui_key FileMenuKey = UIKeyFromString(0, Str8Lit("_FileMenuKey_"));
+                UICtxMenu(FileMenuKey) UIPrefWidth(UIEM(30.0f, 1.0f))
+                {
+                    ui_signal Signal = GFMakeCmdButton(Str8Lit("Open..."));
+                    if(Signal.Flags & UI_SIGNAL_FLAGS_LEFT_PRESSED)
+                    {
+                        gf_cmd_params Params = {0};
+                        Params.Window = (gf_handle)Window;
+                        GFPushCmdRoot(&Params, GF_CMD_KIND_OPEN);
+                        UICtxMenuClose(); 
+                    }
+                }
+                
+                // Edit menu
+                ui_key EditMenuKey = UIKeyFromString(0, Str8Lit("_EditMenuKey_"));
+                UICtxMenu(EditMenuKey) UIPrefWidth(UIEM(30.0f, 1.0f))
+                {
+                    UILabel(Str8Lit("Edit Test"));
+                }
+                
+                UITextAlignment(UI_TEXT_ALIGNMENT_TYPE_CENTER) UIHeightFill
+                {
+                    struct
+                    {
+                        string8 Name;
+                        ui_key MenuKey;
+                    } Items[] =
+                    {
+                        {Str8Lit("File"), FileMenuKey},
+                        {Str8Lit("Edit"), EditMenuKey},
+                    };
+                    
+                    // Determine if a menu is already open
+                    B8 MenuOpen = 0;
+                    U64 OpenMenuIndex = 0;
+                    for(U64 Index = 0; Index < ArrayCount(Items); ++Index)
+                    {
+                        if(UICtxMenuIsOpen(Items[Index].MenuKey))
+                        {
+                            MenuOpen = 1;
+                            OpenMenuIndex -= Index;
+                            break;
+                        }
+                    }
+                    
+                    // Make UI
+                    for(U64 Index = 0; Index < ArrayCount(Items); ++Index)
+                    {
+                        ui_signal Signal = GFMakeTopBarButton(Items[Index].Name);
+                        if(MenuOpen)
+                        {
+                            if(Signal.Flags & UI_SIGNAL_FLAGS_HOVERING && !UICtxMenuIsOpen(Items[Index].MenuKey))
+                            {
+                                UICtxMenuOpen(Items[Index].MenuKey, Signal.Box->Key, Vec2F32(0.0f, Signal.Box->Rect.Bottom -
+                                                                                             Signal.Box->Rect.Top));
+                            }
+                        }
+                        else if(Signal.Flags & UI_SIGNAL_FLAGS_LEFT_PRESSED)
+                        {
+                            if(UICtxMenuIsOpen(Items[Index].MenuKey))
+                            {
+                                UICtxMenuClose();
+                            }
+                            else
+                            {
+                                UICtxMenuOpen(Items[Index].MenuKey, Signal.Box->Key, Vec2F32(0.0f, Signal.Box->Rect.Bottom -
+                                                                                             Signal.Box->Rect.Top));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    if(Window->LastDPI != OSDPIFromWindow(Window->OSWindow))
+        UIUpdateDockNodeForDPIChange(Window->RootDockNode, ContentRect, OSDPIFromWindow(Window->OSWindow) / Window->LastDPI);
+    
+    // Delete dock nodes with no tabs
+    for(ui_dock_node *Node = Window->RootDockNode; Node;)
+    {
+        if(!(Node->First || Node->Kind == UI_DOCK_NODE_KIND_CENTRAL) &&
+           Node->Tabs.TabViewCount == 0)
+        {
+            UIDockingRemoveNode(Node, 1);
+            Node = Window->RootDockNode;
+        }
+        else
+            Node = UIGetDockNodeRecursionPre(Node);
+    }
+    
+    UIUpdateDockNode(Window->RootDockNode, ContentRect, (Window->FramesAlive < 5) || IsWindowResizing);
+    
+    // Create drag/drop sites for dock tabs
+    {
+        ui_view *DragView = GFState->DragDropPayload.View;
+        if(GFDragIsActive() && DragView)
+        {
+            ui_key RootAnimated = UIAnimatedFromString(UI_ANIMATION_RATE_FAST, 1, Str8Lit("###DragDropSites"));
+            F32 RootAnimatedT = UIAnimatedTFromKey(RootAnimated);
+            
+            F32 DropSiteMajorDimPx = CeilF32(UITopFontSize() * 7.0f * RootAnimatedT);
+            F32 DropSiteMinorDimPx = CeilF32(UITopFontSize() * 5.0f * RootAnimatedT);
+            F32 CornerRadius = UITopFontSize() * 0.5f;
+            F32 Padding = CeilF32(UITopFontSize() * 0.5f);
+            
+            for(U32 Axis = 0; Axis < 2; ++Axis)
+                for(U32 Side = 0; Side < 2; ++Side)
+            {
+                B8 ActiveDrag = 0;
+                B8 ActiveFixedDrag = 0;
+                if(GFDragIsActive())
+                {
+                    ActiveDrag = DragView->Kind == UI_VIEW_KIND_NORMAL;
+                    ActiveFixedDrag = (GFState->DragDropPayload.DockNode->Flags & (UI_DOCK_NODE_FLAGS_FIXED_SIZE_X + Axis)) != 0;
+                }
+                
+                if(!ActiveDrag && !ActiveFixedDrag) continue;
+                
+                UICornerRadius(CornerRadius)
+                {
+                    ui_key Key = UIKeyFromStringFmt(0, Str8Lit("###AxisSideNodeSplit_%u_%u"), Axis, Side);
+                    
+                    vec2_f32 ContentCenter = Add2F32(Div2F32(Dim2F32(ContentRect), Vec2F32(2.0f, 2.0f)), ContentRect.TopLeft);
+                    
+                    rng2_f32 SiteRect = ContentRect;
+                    SiteRect.TopLeft.V[Axis2Flip(Axis)] = ContentCenter.V[Axis2Flip(Axis)] - DropSiteMajorDimPx / 2.0f;
+                    SiteRect.BottomRight.V[Axis2Flip(Axis)] = ContentCenter.V[Axis2Flip(Axis)] + DropSiteMajorDimPx / 2.0f;
+                    SiteRect.TopLeft.V[Axis] = ContentRect.V[Side].V[Axis] - DropSiteMinorDimPx / 2.0f;
+                    SiteRect.BottomRight.V[Axis] = ContentRect.V[Side].V[Axis] + DropSiteMinorDimPx / 2.0f;
+                    
+                    // Animate
+                    ui_key Animated = UIAnimatedKeyFromStringFmt(Str8Lit("###AxisSideNodeSplit_%u_%u"), Axis, Side);
+                    ui_animation_rate AnimationRate = UI_ANIMATION_RATE_FAST;
+                    F32 AnimatedT = 0.0f;
+                    if(UIGetAnimatedFromKey(Animated))
+                        AnimatedT = UIAnimatedTFromKey(Animated);
+                    SiteRect = Pad2F32(SiteRect, RoundF32(UITopFontSize() * 0.25f * AnimatedT));
+                    
+                    // Build
+                    ui_box *SiteBox = 0;
+                    {
+                        UIRect(SiteRect)
+                        {
+                            SiteBox = UIMakeBoxFromKey(UI_BOX_FLAG_DROP_SITE, Key);
+                            UISignalFromBox(SiteBox);
+                        }
+                        ui_box *SiteBoxViz = 0;
+                        UIParent(SiteBox) UIWidthFill UIHeightFill
+                            UIPadding(UIPX(Padding, 1.0f))
+                            UIColumn
+                            UIPadding(UIPX(Padding, 1.0f))
+                        {
+                            UISetNextChildLayoutAxis(Axis2Flip(Axis));
+                            
+                            if(Key == UIDropHotKey())
+                            {
+                                UISetNextBorderColor(GFRGBAFromThemeColor(GF_THEME_COLOR_HIGHLIGHT));
+                                UIAnimated(AnimationRate, 1, Animated);
+                            }
+                            else
+                                UIAnimated(AnimationRate, 0, Animated);
+                            
+                            SiteBoxViz = UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BACKGROUND | UI_BOX_FLAG_DRAW_BORDER, 0);
+                        }
+                        UIParent(SiteBoxViz) UIWidthFill UIHeightFill
+                            UIPadding(UIPX(Padding, 1.0f))
+                        {
+                            UISetNextChildLayoutAxis(Axis);
+                            ui_box *RowOrColumn = UIMakeBoxFromKey(0, 0);
+                            UIParent(RowOrColumn) UIPadding(UIPX(Padding, 1.0f))
+                            {
+                                UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BORDER, 0);
+                                UISpacer(UIPX(Padding, 1.0f));
+                                UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BORDER, 0);
+                            }
+                        }
+                    }
+                    
+                    // Viz
+                    if(SiteBox->Key == UIDropHotKey())
+                    {
+                        rng2_f32 FutureSplitRect = SiteRect;
+                        FutureSplitRect.TopLeft.V[Axis] -= DropSiteMajorDimPx;
+                        FutureSplitRect.BottomRight.V[Axis] += DropSiteMajorDimPx;
+                        FutureSplitRect.TopLeft.V[Axis2Flip(Axis)] = ContentRect.TopLeft.V[Axis2Flip(Axis)];
+                        FutureSplitRect.BottomRight.V[Axis2Flip(Axis)] = ContentRect.BottomRight.V[Axis2Flip(Axis)];
+                        UIRect(FutureSplitRect)
+                        {
+                            UISetNextBackgroundColor(GFRGBAFromThemeColor(GF_THEME_COLOR_DROP_SITE_OVERLAY));
+                            UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BACKGROUND, 0);
+                        }
+                    }
+                    
+                    // Drop
+                    gf_drag_drop_payload Payload = {0};
+                    if(SiteBox->Key == UIDropHotKey() && GFDragDrop(&Payload))
+                    {
+                        gf_cmd_kind Dir = 0;
+                        if(Axis == AXIS2_X && Side == 0) Dir = GF_CMD_KIND_NEW_PANEL_LEFT;
+                        else if(Axis == AXIS2_X && Side == 1) Dir = GF_CMD_KIND_NEW_PANEL_RIGHT;
+                        else if(Axis == AXIS2_Y && Side == 0) Dir = GF_CMD_KIND_NEW_PANEL_UP;
+                        else if(Axis == AXIS2_Y && Side == 1) Dir = GF_CMD_KIND_NEW_PANEL_DOWN;
+                        
+                        gf_cmd_params Params = {0};
+                        ui_dock_node *SplitNode = Window->RootDockNode;
+                        Params.Window = (gf_handle)Window;
+                        Params.DestDock = SplitNode;
+                        Params.Dock = Payload.DockNode;
+                        Params.View = Payload.View;
+                        Params.Size = ActiveFixedDrag ? Payload.DockNode->Size.V[Axis] : UITopFontSize() * 20.0f;
+                        GFPushCmdRoot(&Params, Dir);
+                    }
+                }
+            }
+            
+            for(ui_dock_node *Node = Window->RootDockNode; Node; Node = UIGetDockNodeRecursionPre(Node))
+            {    
+                B8 ActiveDrag = 0;
+                B8 ActiveFixedDrag = 0;
+                if(GFDragIsActive())
+                {
+                    B8 CentralNodeChild = UIDockingIsCentralNodeChild(Node);
+                    ActiveDrag |= DragView->Kind == UI_VIEW_KIND_CONTENT && CentralNodeChild;
+                    ActiveDrag |= DragView->Kind == UI_VIEW_KIND_NORMAL && !CentralNodeChild;
+                    
+                    if(Node->Parent == 0 && Node->Kind == UI_DOCK_NODE_KIND_GLOBAL)   
+                    {
+                        axis2 Axis = Node->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT ||
+                            Node->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_RIGHT ? 0 : 1;
+                        ActiveFixedDrag = (GFState->DragDropPayload.DockNode->Flags &
+                                           (UI_DOCK_NODE_FLAGS_FIXED_SIZE_X + Axis)) != 0;
+                    }
+                }
+                
+                if((!ActiveDrag && !ActiveFixedDrag) || (Node->Kind == UI_DOCK_NODE_KIND_LOCAL && Node->First == 0)) continue;
+                
+                rng2_f32 DockRect = Rng2F32(Node->Position, Add2F32(Node->Position, Node->Size));
+                vec2_f32 DockCenter = Add2F32(Div2F32(Node->Size, Vec2F32(2.0f, 2.0f)), Node->Position);
+                
+                axis2 SplitAxis = Node->SplitAxis;
+                
+                if(Node->Parent == 0 && Node->Kind == UI_DOCK_NODE_KIND_GLOBAL)
+                {
+                    UICornerRadius(CornerRadius)
+                    {
+                        axis2 Axis = Node->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT ||
+                            Node->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_RIGHT ? AXIS2_X : AXIS2_Y;
+                        U32 Side = Node->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT ||
+                            Node->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_UP ? 1 : 0;
+                        
+                        ui_key Key = UIKeyFromStringFmt(0, Str8Lit("###GlobalNodeSplit_%p"), Node);
+                        
+                        rng2_f32 SiteRect = DockRect;
+                        SiteRect.TopLeft.V[Axis2Flip(Axis)] = DockCenter.V[Axis2Flip(Axis)] - DropSiteMajorDimPx / 2.0f;
+                        SiteRect.BottomRight.V[Axis2Flip(Axis)] = DockCenter.V[Axis2Flip(Axis)] + DropSiteMajorDimPx / 2.0f;
+                        SiteRect.TopLeft.V[Axis] = DockRect.V[Side].V[Axis] - DropSiteMinorDimPx / 2.0f;
+                        SiteRect.BottomRight.V[Axis] = DockRect.V[Side].V[Axis] + DropSiteMinorDimPx / 2.0f;
+                        
+                        // Animate
+                        ui_key Animated = UIAnimatedKeyFromStringFmt(Str8Lit("###GlobalNodeSplit_%p"), Node);
+                        ui_animation_rate AnimationRate = UI_ANIMATION_RATE_FAST;
+                        F32 AnimatedT = 0.0f;
+                        if(UIGetAnimatedFromKey(Animated))
+                            AnimatedT = UIAnimatedTFromKey(Animated);
+                        SiteRect = Pad2F32(SiteRect, RoundF32(UITopFontSize() * 0.25f * AnimatedT));
+                        
+                        // Build
+                        ui_box *SiteBox = 0;
+                        {
+                            UIRect(SiteRect)
+                            {
+                                SiteBox = UIMakeBoxFromKey(UI_BOX_FLAG_DROP_SITE, Key);
+                                UISignalFromBox(SiteBox);
+                            }
+                            ui_box *SiteBoxViz = 0;
+                            UIParent(SiteBox) UIWidthFill UIHeightFill
+                                UIPadding(UIPX(Padding, 1.0f))
+                                UIColumn
+                                UIPadding(UIPX(Padding, 1.0f))
+                            {
+                                UISetNextChildLayoutAxis(Axis2Flip(Axis));
+                                
+                                if(Key == UIDropHotKey())
+                                {
+                                    UISetNextBorderColor(GFRGBAFromThemeColor(GF_THEME_COLOR_HIGHLIGHT));
+                                    UIAnimated(AnimationRate, 1, Animated);
+                                }
+                                else
+                                    UIAnimated(AnimationRate, 0, Animated);
+                                
+                                SiteBoxViz = UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BACKGROUND | UI_BOX_FLAG_DRAW_BORDER, 0);
+                            }
+                            UIParent(SiteBoxViz) UIWidthFill UIHeightFill
+                                UIPadding(UIPX(Padding, 1.0f))
+                            {
+                                UISetNextChildLayoutAxis(Axis);
+                                ui_box *RowOrColumn = UIMakeBoxFromKey(0, 0);
+                                UIParent(RowOrColumn) UIPadding(UIPX(Padding, 1.0f))
+                                {
+                                    UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BORDER, 0);
+                                    UISpacer(UIPX(Padding, 1.0f));
+                                    UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BORDER, 0);
+                                }
+                            }
+                        }
+                        
+                        // Viz
+                        if(SiteBox->Key == UIDropHotKey())
+                        {
+                            rng2_f32 FutureSplitRect = SiteRect;
+                            FutureSplitRect.TopLeft.V[Axis] -= DropSiteMajorDimPx;
+                            FutureSplitRect.BottomRight.V[Axis] += DropSiteMajorDimPx;
+                            FutureSplitRect.TopLeft.V[Axis2Flip(Axis)] = DockRect.TopLeft.V[Axis2Flip(Axis)];
+                            FutureSplitRect.BottomRight.V[Axis2Flip(Axis)] = DockRect.BottomRight.V[Axis2Flip(Axis)];
+                            UIRect(FutureSplitRect)
+                            {
+                                UISetNextBackgroundColor(GFRGBAFromThemeColor(GF_THEME_COLOR_DROP_SITE_OVERLAY));
+                                UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BACKGROUND, 0);
+                            }
+                        }
+                        
+                        // Drop
+                        gf_drag_drop_payload Payload = {0};
+                        if(SiteBox->Key == UIDropHotKey() && GFDragDrop(&Payload))
+                        {
+                            gf_cmd_kind Dir = 0;
+                            switch(Node->GlobalSplitDir)
+                            {
+                                case UI_DOCKSPACE_SPLIT_DIR_LEFT:  Dir = GF_CMD_KIND_NEW_PANEL_RIGHT; break;
+                                case UI_DOCKSPACE_SPLIT_DIR_RIGHT: Dir = GF_CMD_KIND_NEW_PANEL_LEFT;  break;
+                                case UI_DOCKSPACE_SPLIT_DIR_UP:    Dir = GF_CMD_KIND_NEW_PANEL_DOWN;  break;
+                                case UI_DOCKSPACE_SPLIT_DIR_DOWN:  Dir = GF_CMD_KIND_NEW_PANEL_UP;    break;
+                            };
+                            
+                            gf_cmd_params Params = {0};
+                            ui_dock_node *SplitNode = Node;
+                            Params.Window = (gf_handle)Window;
+                            Params.DestDock = SplitNode;
+                            Params.Dock = Payload.DockNode;
+                            Params.View = Payload.View;
+                            Params.Size = ActiveFixedDrag ? Payload.DockNode->Size.V[Axis] : UITopFontSize() * 20.0f;
+                            GFPushCmdRoot(&Params, Dir);
+                        }
+                    }
+                }
+                
+                UICornerRadius(CornerRadius)
+                {
+                    for(ui_dock_node *Child = Node->First;
+                        Node->First && !(Child == 0 && Node->Parent && Node->Parent->SplitAxis == SplitAxis) && ActiveDrag;
+                        Child = Child->Next)
+                    {                        
+                        rng2_f32 ChildRect = {0};
+                        if(Child) ChildRect = Rng2F32(Child->Position, Add2F32(Child->Position, Child->Size));
+                        else
+                        {
+                            ui_dock_node *Prev = Node->Last;
+                            ChildRect.TopLeft.V[SplitAxis] = Prev->Position.V[SplitAxis] + Prev->Size.V[SplitAxis];
+                            ChildRect.TopLeft.V[Axis2Flip(SplitAxis)] = Prev->Position.V[Axis2Flip(SplitAxis)];
+                            ChildRect.BottomRight.X = Prev->Position.X + Prev->Size.X;
+                            ChildRect.BottomRight.Y = Prev->Position.Y + Prev->Size.Y;
+                        }
+                        vec2_f32 ChildRectCenter = Add2F32(Div2F32(Dim2F32(ChildRect), Vec2F32(2.0f, 2.0f)), ChildRect.TopLeft);
+                        
+                        ui_key Key = UIKeyFromStringFmt(0, Str8Lit("###DropBoundary_%p_%p"), Node, Child);
+                        rng2_f32 SiteRect = Rng2F32(ChildRectCenter, ChildRectCenter);
+                        SiteRect.TopLeft.V[SplitAxis] = ChildRect.TopLeft.V[SplitAxis] - DropSiteMinorDimPx / 2.0f;
+                        SiteRect.BottomRight.V[SplitAxis] = ChildRect.TopLeft.V[SplitAxis] + DropSiteMinorDimPx / 2.0f;
+                        SiteRect.TopLeft.V[Axis2Flip(SplitAxis)] -= DropSiteMajorDimPx / 2.0f;
+                        SiteRect.BottomRight.V[Axis2Flip(SplitAxis)] += DropSiteMajorDimPx / 2.0f;
+                        
+                        // Aniimate
+                        ui_key Animated = UIAnimatedKeyFromStringFmt(Str8Lit("###DropBoundary_%p_%p"), Node, Child);
+                        ui_animation_rate AnimationRate = UI_ANIMATION_RATE_FAST;
+                        F32 AnimatedT = 0.0f;
+                        if(UIGetAnimatedFromKey(Animated))
+                            AnimatedT = UIAnimatedTFromKey(Animated);
+                        SiteRect = Pad2F32(SiteRect, RoundF32(UITopFontSize() * 0.25f * AnimatedT));
+                        
+                        // Build
+                        ui_box *SiteBox = 0;
+                        {
+                            UIRect(SiteRect)
+                            {
+                                SiteBox = UIMakeBoxFromKey(UI_BOX_FLAG_DROP_SITE, Key);
+                                UISignalFromBox(SiteBox);
+                            }
+                            ui_box *SiteBoxViz = 0;
+                            UIParent(SiteBox) UIWidthFill UIHeightFill
+                                UIPadding(UIPX(Padding, 1.0f))
+                                UIColumn
+                                UIPadding(UIPX(Padding, 1.0f))
+                            {
+                                UISetNextChildLayoutAxis(Axis2Flip(SplitAxis));
+                                
+                                if(Key == UIDropHotKey())
+                                {
+                                    UISetNextBorderColor(GFRGBAFromThemeColor(GF_THEME_COLOR_HIGHLIGHT));
+                                    UIAnimated(AnimationRate, 1, Animated);
+                                }
+                                else
+                                    UIAnimated(AnimationRate, 0, Animated);
+                                
+                                SiteBoxViz = UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BACKGROUND | UI_BOX_FLAG_DRAW_BORDER, 0);
+                            }
+                            UIParent(SiteBoxViz) UIWidthFill UIHeightFill UIPadding(UIPX(Padding, 1.0f))
+                            {
+                                UISetNextChildLayoutAxis(SplitAxis);
+                                ui_box *RowOrColumn = UIMakeBoxFromKey(0, 0);
+                                UIParent(RowOrColumn) UIPadding(UIPX(Padding, 1.0f))
+                                {
+                                    UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BORDER, 0);
+                                    UISpacer(UIPX(Padding, 1.0f));
+                                    UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BORDER, 0);
+                                }
+                            }
+                        }
+                        
+                        // Viz
+                        if(SiteBox->Key == UIDropHotKey())
+                        {
+                            rng2_f32 FutureSplitRect = SiteRect;
+                            FutureSplitRect.TopLeft.V[SplitAxis] -= DropSiteMajorDimPx;
+                            FutureSplitRect.BottomRight.V[SplitAxis] += DropSiteMajorDimPx;
+                            FutureSplitRect.TopLeft.V[Axis2Flip(SplitAxis)] = ChildRect.TopLeft.V[Axis2Flip(SplitAxis)];
+                            FutureSplitRect.BottomRight.V[Axis2Flip(SplitAxis)] = ChildRect.BottomRight.V[Axis2Flip(SplitAxis)];
+                            UIRect(FutureSplitRect)
+                            {
+                                UISetNextBackgroundColor(GFRGBAFromThemeColor(GF_THEME_COLOR_DROP_SITE_OVERLAY));
+                                UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BACKGROUND, 0);
+                            }
+                        }
+                        
+                        // Drop
+                        gf_drag_drop_payload Payload = {0};
+                        if(SiteBox->Key == UIDropHotKey() && GFDragDrop(&Payload))
+                        {
+                            gf_cmd_kind Dir = Node->SplitAxis == AXIS2_X ? GF_CMD_KIND_NEW_PANEL_LEFT : GF_CMD_KIND_NEW_PANEL_UP;
+                            ui_dock_node *SplitNode = Child;
+                            if(SplitNode == 0)
+                            {
+                                Dir = Node->SplitAxis == AXIS2_X ? GF_CMD_KIND_NEW_PANEL_RIGHT : GF_CMD_KIND_NEW_PANEL_DOWN;
+                                SplitNode = Node->Last;
+                            }
+                            
+                            gf_cmd_params Params = {0};
+                            Params.Window = (gf_handle)Window;
+                            Params.DestDock = SplitNode;
+                            Params.Dock = Payload.DockNode;
+                            Params.View = Payload.View;
+                            Params.Size = 0.5f;
+                            GFPushCmdRoot(&Params, Dir);
+                        }
+                        
+                        if(Child == 0) break;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Render dock nodes
+    for(ui_dock_node *Node = Window->RootDockNode->Next;;)
+    {
+        Assert(Node);
+        if(Node->First == 0)
+        {
+            vec2_f32 TopLeft = Node->AnimatedPos;
+            vec2_f32 BottomRight = Add2F32(TopLeft, Node->AnimatedSize);
+            rng2_f32 DockRect = Rng2F32(TopLeft, BottomRight);
+            
+            B8 TabBarEnabled = (Node->Flags & UI_DOCK_NODE_FLAGS_ONE_TAB) == 0;
+            B8 SideTabBar = Node->Size.X > Node->Size.Y && (Node->Flags & UI_DOCK_NODE_FLAGS_FIXED_SIZE_Y);
+            
+            F32 TabBarRHeight = TabBarEnabled ? UITopFontSize() * 3.0f : UITopFontSize() * 1.0f;
+            F32 TabBarVHeight = TabBarEnabled ? UITopFontSize() * 2.6f : UITopFontSize() * 0.75f;
+            F32 TabBarRVDiff = TabBarRHeight - TabBarVHeight;
+            F32 TabSpacing = UITopFontSize() * 0.4f;
+            
+            rng2_f32 TopBarRect = Rng2F32(DockRect.TopLeft, Vec2F32(DockRect.Right, DockRect.Top + TabBarVHeight));
+            rng2_f32 ContentRect = Rng2F32(Vec2F32(DockRect.Left, DockRect.Top + TabBarVHeight), DockRect.BottomRight);
+            if(!TabBarEnabled && SideTabBar)
+            {
+                TopBarRect = Rng2F32(DockRect.TopLeft, Vec2F32(DockRect.Right - TabBarVHeight, DockRect.Bottom));
+                ContentRect = Rng2F32(Vec2F32(DockRect.Left + TabBarVHeight, DockRect.Top), DockRect.BottomRight);
+            }
+            
+            F32 CornerRadius = UIEM(0.6f, 1.0f).Value;
+            
+            B8 ActiveDrag = 0;
+            if(GFDragIsActive())
+            {
+                B8 CentralNodeChild = UIDockingIsCentralNodeChild(Node);
+                ui_view *View = GFState->DragDropPayload.View;
+                ActiveDrag |= View->Kind == UI_VIEW_KIND_CONTENT && CentralNodeChild;
+                ActiveDrag |= View->Kind == UI_VIEW_KIND_NORMAL && !CentralNodeChild;
+            }
+            
+            // Build drag/drop sites
+            {
+                ui_view *View = GFState->DragDropPayload.View;
+                if((Node->Flags & UI_DOCK_NODE_FLAGS_ONE_TAB) == 0 && ActiveDrag && View && Contains2F32(DockRect, UIMouse()))
+                {
+                    ui_key Animated = UIAnimatedFromStringFmt(UI_ANIMATION_RATE_FAST, 1, Str8Lit("###DockSites_%p"), Node);
+                    F32 AnimatedT = UIAnimatedTFromKey(Animated);
+                    
+                    F32 DropSiteDimPx = CeilF32(UITopFontSize() * 7.0f * AnimatedT);
+                    vec2_f32 DropSiteHalfDim = Vec2F32(DropSiteDimPx / 2.0f, DropSiteDimPx / 2.0f);
+                    vec2_f32 DockCenter = Add2F32(Div2F32(Dim2F32(DockRect), Vec2F32(2.0f, 2.0f)), DockRect.TopLeft);
+                    F32 CornerRadius = UITopFontSize() * 0.5f;
+                    F32 Padding = CeilF32(UITopFontSize() * 0.5f);
+                    
+                    struct
+                    {
+                        ui_key Key;
+                        ui_dockspace_split_dir SplitDir;
+                        rng2_f32 Rect;
+                    }Sites[] =
+                    {
+                        {
+                            UIKeyFromStringFmt(0, Str8Lit("DropSplitCenter_%p"), Node),
+                            UI_DOCKSPACE_SPLIT_DIR_COUNT,
+                            Rng2F32(Sub2F32(DockCenter, DropSiteHalfDim),
+                                    Add2F32(DockCenter, DropSiteHalfDim)),
+                        },
+                        {
+                            UIKeyFromStringFmt(0, Str8Lit("DropSplitUp_%p"), Node),
+                            UI_DOCKSPACE_SPLIT_DIR_UP,
+                            Rng2F32(Vec2F32(DockCenter.X - DropSiteHalfDim.X,
+                                            DockCenter.Y - DropSiteHalfDim.Y - DropSiteHalfDim.Y * 2),
+                                    Vec2F32(DockCenter.X + DropSiteHalfDim.X,
+                                            DockCenter.Y + DropSiteHalfDim.Y - DropSiteHalfDim.Y * 2)),
+                        },
+                        {
+                            UIKeyFromStringFmt(0, Str8Lit("DropSplitDown_%p"), Node),
+                            UI_DOCKSPACE_SPLIT_DIR_DOWN,
+                            Rng2F32(Vec2F32(DockCenter.X - DropSiteHalfDim.X,
+                                            DockCenter.Y - DropSiteHalfDim.Y + DropSiteHalfDim.Y * 2),
+                                    Vec2F32(DockCenter.X + DropSiteHalfDim.X,
+                                            DockCenter.Y + DropSiteHalfDim.Y + DropSiteHalfDim.Y * 2)),
+                        },
+                        {
+                            UIKeyFromStringFmt(0, Str8Lit("DropSplitLeft_%p"), Node),
+                            UI_DOCKSPACE_SPLIT_DIR_LEFT,
+                            Rng2F32(Vec2F32(DockCenter.X - DropSiteHalfDim.X - DropSiteHalfDim.X * 2,
+                                            DockCenter.Y - DropSiteHalfDim.Y),
+                                    Vec2F32(DockCenter.X + DropSiteHalfDim.X - DropSiteHalfDim.X * 2,
+                                            DockCenter.Y + DropSiteHalfDim.Y)),
+                        },
+                        {
+                            UIKeyFromStringFmt(0, Str8Lit("DropSplitRight_%p"), Node),
+                            UI_DOCKSPACE_SPLIT_DIR_RIGHT,
+                            Rng2F32(Vec2F32(DockCenter.X - DropSiteHalfDim.X + DropSiteHalfDim.X * 2,
+                                            DockCenter.Y - DropSiteHalfDim.Y),
+                                    Vec2F32(DockCenter.X + DropSiteHalfDim.X + DropSiteHalfDim.X * 2,
+                                            DockCenter.Y + DropSiteHalfDim.Y)),
+                        },
+                    };
+                    
+                    UICornerRadius(CornerRadius)
+                    {
+                        for(U32 Index = 0; Index < ArrayCount(Sites); ++Index)
+                        {
+                            ui_key Key = Sites[Index].Key;
+                            ui_dockspace_split_dir Dir = Sites[Index].SplitDir;
+                            rng2_f32 Rect = Sites[Index].Rect;
+                            axis2 SplitAxis = Dir == UI_DOCKSPACE_SPLIT_DIR_LEFT || Dir == UI_DOCKSPACE_SPLIT_DIR_RIGHT ? AXIS2_X : AXIS2_Y;
+                            U32 SplitSide = Dir == UI_DOCKSPACE_SPLIT_DIR_LEFT || Dir == UI_DOCKSPACE_SPLIT_DIR_UP ? 0 : 1;
+                            
+                            if(Dir != UI_DOCKSPACE_SPLIT_DIR_COUNT && Node->Parent && SplitAxis == Node->Parent->SplitAxis)
+                                continue;
+                            
+                            if(Node->Kind == UI_DOCK_NODE_KIND_GLOBAL && Dir != UI_DOCKSPACE_SPLIT_DIR_COUNT)
+                            {
+                                axis2 GlobalAxis = Node->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_LEFT ||
+                                    Node->GlobalSplitDir == UI_DOCKSPACE_SPLIT_DIR_RIGHT ? AXIS2_X : AXIS2_Y;
+                                if(GlobalAxis == SplitAxis) continue;
+                            }
+                            
+                            ui_key Animated = UIAnimatedKeyFromStringFmt(Str8Lit("###DockSite_%p_%u"), Node, Index);
+                            ui_animation_rate AnimationRate = UI_ANIMATION_RATE_FAST;
+                            F32 AnimatedT = 0.0f;
+                            if(UIGetAnimatedFromKey(Animated))
+                                AnimatedT = UIAnimatedTFromKey(Animated);
+                            Rect = Pad2F32(Rect, RoundF32(UITopFontSize() * 0.25f * AnimatedT));
+                            
+                            ui_box *SiteBox = 0;
+                            {
+                                UIRect(Rect)
+                                {
+                                    SiteBox = UIMakeBoxFromKey(UI_BOX_FLAG_DROP_SITE, Key);
+                                    UISignalFromBox(SiteBox);
+                                }
+                                
+                                ui_box *SiteBoxViz = 0;
+                                UIParent(SiteBox) UIWidthFill UIHeightFill
+                                    UIPadding(UIPX(Padding, 1.0f))
+                                    UIColumn
+                                    UIPadding(UIPX(Padding,  1.0f))
+                                {
+                                    UISetNextChildLayoutAxis(Axis2Flip(SplitAxis));
+                                    
+                                    if(Key == UIDropHotKey())
+                                    {
+                                        UISetNextBorderColor(GFRGBAFromThemeColor(GF_THEME_COLOR_HIGHLIGHT));
+                                        UIAnimated(AnimationRate, 1, Animated);
+                                    }
+                                    else
+                                        UIAnimated(AnimationRate, 0, Animated);
+                                    
+                                    SiteBoxViz = UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BACKGROUND | UI_BOX_FLAG_DRAW_BORDER, 0);
+                                }
+                                
+                                if(Dir != UI_DOCKSPACE_SPLIT_DIR_COUNT)
+                                {
+                                    UIParent(SiteBoxViz) UIWidthFill UIHeightFill UIPadding(UIPX(Padding, 1.0f))
+                                    {
+                                        UISetNextChildLayoutAxis(SplitAxis);
+                                        ui_box *RowOrColumn = UIMakeBoxFromKey(0, 0);
+                                        UIParent(RowOrColumn) UIPadding(UIPX(Padding, 1.0f))
+                                        {
+                                            if(SplitSide == 0)
+                                            {
+                                                UISetNextFlags(UI_BOX_FLAG_DRAW_BACKGROUND);
+                                                UISetNextBackgroundColor(GFRGBAFromThemeColor(GF_THEME_COLOR_DROP_SITE_OVERLAY));
+                                            }
+                                            UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BORDER, 0);
+                                            UISpacer(UIPX(Padding, 1.0f));
+                                            
+                                            if(SplitSide == 1)
+                                            {
+                                                UISetNextFlags(UI_BOX_FLAG_DRAW_BACKGROUND);
+                                                UISetNextBackgroundColor(GFRGBAFromThemeColor(GF_THEME_COLOR_DROP_SITE_OVERLAY));
+                                            }
+                                            UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BORDER, 0);
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    UIParent(SiteBoxViz) UIWidthFill UIHeightFill UIPadding(UIPX(Padding, 1.0f))
+                                    {
+                                        UISetNextChildLayoutAxis(SplitAxis);
+                                        ui_box *RowOrColumn = UIMakeBoxFromKey(0, 0);
+                                        UIParent(RowOrColumn) UIPadding(UIPX(Padding, 1.0f))
+                                        {
+                                            UISetNextBackgroundColor(GFRGBAFromThemeColor(GF_THEME_COLOR_DROP_SITE_OVERLAY));
+                                            UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BORDER | UI_BOX_FLAG_DRAW_BACKGROUND, 0);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            gf_drag_drop_payload Payload = {0};
+                            if(SiteBox->Key == UIDropHotKey() && GFDragDrop(&Payload))
+                            {
+                                if(Dir != UI_DOCKSPACE_SPLIT_DIR_COUNT)
+                                {
+                                    gf_cmd_kind CmdKind = Dir + GF_CMD_KIND_NEW_PANEL_LEFT;
+                                    gf_cmd_params Params = {0};
+                                    Params.Window = (gf_handle)Window;
+                                    Params.Dock = Payload.DockNode;
+                                    Params.DestDock = Node;
+                                    Params.View = Payload.View;
+                                    Params.Size = 0.5f;
+                                    GFPushCmdRoot(&Params, CmdKind);
+                                }
+                                else
+                                {
+                                    gf_cmd_params Params = {0};
+                                    Params.Window = (gf_handle)Window;
+                                    Params.Dock = Payload.DockNode;
+                                    Params.DestDock = Node;
+                                    Params.View = Payload.View;
+                                    Params.PrevView = Node->Tabs.LastTabView;
+                                    GFPushCmdRoot(&Params, GF_CMD_KIND_MOVE_TAB);
+                                }
+                            }
+                        }
+                    }
+                    
+                    for(U32 Index = 0; Index < ArrayCount(Sites); ++Index)
+                    {
+                        if(UIDropHotKey() == Sites[Index].Key)
+                        {
+                            ui_dockspace_split_dir Dir = Sites[Index].SplitDir;
+                            axis2 SplitAxis = Dir == UI_DOCKSPACE_SPLIT_DIR_LEFT || Dir == UI_DOCKSPACE_SPLIT_DIR_RIGHT ? AXIS2_X : AXIS2_Y;
+                            U32 SplitSide = Dir ==  UI_DOCKSPACE_SPLIT_DIR_LEFT || Dir == UI_DOCKSPACE_SPLIT_DIR_UP ? 0 : 1;
+                            rng2_f32 FutureSplitRect = DockRect;
+                            
+                            if(Sites[Index].SplitDir != UI_DOCKSPACE_SPLIT_DIR_COUNT)
+                                FutureSplitRect.V[!SplitSide].V[SplitAxis] = DockCenter.V[SplitAxis];
+                            
+                            UIRect(FutureSplitRect)
+                            {
+                                UISetNextBackgroundColor(GFRGBAFromThemeColor(GF_THEME_COLOR_DROP_SITE_OVERLAY));
+                                UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BACKGROUND, 0);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            B8 CatchallDropSiteHovered = 0;
+            if(ActiveDrag && UIDropHotKey() == 0)
+            {
+                UIRect(DockRect)
+                {
+                    ui_key Key = UIKeyFromStringFmt(0, Str8Lit("CatchallDropSite_%p"), Node);
+                    ui_box *CatchallDropSite = UIMakeBoxFromKey(UI_BOX_FLAG_DROP_SITE, Key);
+                    UISignalFromBox(CatchallDropSite);
+                    CatchallDropSiteHovered = Key == UIDropHotKey();
+                }
+            }
+            
+            ui_box *DockBox = 0;
+            UIRect(ContentRect) UIChildLayoutAxis(AXIS2_Y) UICornerRadius(0.0f)
+            {
+                ui_box_flags Flags = UI_BOX_FLAG_CLIP | UI_BOX_FLAG_DRAW_BORDER | UI_BOX_FLAG_DRAW_BACKGROUND | UI_BOX_FLAG_CLICKABLE;
+                // Focus dock node if its painting state is the selected one
+                if(GFCoreState->CurrentPaintingState && GFCoreState->CurrentPaintingState->Canvas == Node->Tabs.SelectedTabView)
+                    Flags |= UI_BOX_FLAG_DRAW_BORDER_FOCUS;
+                DockBox = UIMakeBoxFromStringFmt(Flags, Str8Lit("###DockWindow_%p"), Node);
+            }
+            
+            // Build selected tab view
+            UIParent(DockBox)
+                UIWidthFill
+            {
+                ui_box *ViewContainerBox = 0;
+                UIFixedWidth(Dim2F32(ContentRect).X)
+                    UIFixedHeight(Dim2F32(ContentRect).Y)
+                    UIChildLayoutAxis(AXIS2_Y)
+                {
+                    ViewContainerBox = UIMakeBoxFromString(0, Str8Lit("###ViewContainer"));
+                }
+                
+                UIParent(ViewContainerBox)
+                {
+                    if(Node->Tabs.SelectedTabView)
+                    {
+                        Node->Tabs.SelectedTabView->Spec->BuildViewUIHook(Node->Tabs.SelectedTabView, Dim2F32(ContentRect),
+                                                                          Window->OSWindow, GFState->Delta);
+                    }
+                    else
+                    {
+                        // TODO: Build empty view
+                    }
+                }
+            }
+
+            ui_signal DockSignal = UISignalFromBox(DockBox);
+            
+            // Build top bar
+            {
+                ui_box *TopBarBox = 0;
+                
+                UICornerRadius(0.0f) UIRect(TopBarRect)
+                {
+                    ui_box_flags Flags = UI_BOX_FLAG_CLIP | UI_BOX_FLAG_ALLOW_OVERFLOW_Y | UI_BOX_FLAG_VIEW_CLAMP_X |
+                        UI_BOX_FLAG_VIEW_SCROLL_X | UI_BOX_FLAG_CLICKABLE | UI_BOX_FLAG_DRAW_BACKGROUND;
+                    if(!TabBarEnabled)
+                    {
+                        UISetNextBackgroundColor(GFRGBAFromThemeColor(GF_THEME_COLOR_TAB_ACTIVE));
+                        UISetNextCornerRadius0(5.0f);
+                        UISetNextCornerRadius1(SideTabBar ? 5.0f : 0.0f);
+                        UISetNextCornerRadius2(SideTabBar ? 0.0f : 5.0f);
+                    }
+                    TopBarBox = UIMakeBoxFromStringFmt(Flags, Str8Lit("###TabBar_%p"), Node);
+                }
+                
+                if(TabBarEnabled)
+                {
+                    temp_arena Scratch = GetScratch(0, 0);
+                    
+                    typedef struct drop_site drop_site;
+                    struct drop_site
+                    {
+                        F32 P;
+                        ui_view *PrevView;
+                    };
+                    
+                    ui_view *NextSelectedTabView = Node->Tabs.SelectedTabView;
+                    U32 DropSiteCount = Node->Tabs.TabViewCount + 1;
+                    drop_site *DropSites = PushArray(Scratch.Arena, drop_site, DropSiteCount);
+                    F32 DropSiteMaxP = 0.0f;
+                    U32 ViewIndex = 0;
+                    
+                    UIParent(TopBarBox) UIPrefHeight(UIPct(1.0f, 0.0f))
+                    {
+                        UISpacer(UIPX(1.0f, 1.0f));
+                        
+                        // Build tabs
+                        UIPrefWidth(UIEM(12.0f, 0.5f))
+                            UICornerRadius0(CornerRadius)
+                            UICornerRadius1(0.0f)
+                            UICornerRadius2(CornerRadius)
+                            UICornerRadius3(0.0f)
+                        {
+                            for(ui_view *View = Node->Tabs.FirstTabView;; View = View->Next, ++ViewIndex)
+                            {
+                                if(ActiveDrag && CatchallDropSiteHovered)
+                                {
+                                    ui_dock_node *DstNode = GFState->LastDragDropDock;
+                                    ui_view *DragView = GFState->DragDropPayload.View;
+                                    ui_view *DstPrevView = GFState->LastDragDropPrevTab;
+                                    if(DstNode == Node &&
+                                       ((View && DstPrevView == View->Prev && DragView != View && DragView != View->Prev) ||
+                                        (View == 0 && DstPrevView == Node->Tabs.LastTabView && DragView != Node->Tabs.LastTabView)))
+                                    {
+                                        UIPrefWidth(UIEM(9.0f, 0.2f)) UIColumn
+                                        {
+                                            UISpacer(UIEM(0.2f, 1.0f));
+                                            UIBackgroundColor(GFRGBAFromThemeColor(GF_THEME_COLOR_DROP_SITE_OVERLAY))
+                                            {
+                                                UIMakeBoxFromKey(UI_BOX_FLAG_DRAW_BACKGROUND | UI_BOX_FLAG_DRAW_BORDER, 0);
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                if(View == 0) break;
+                                
+                                B8 ViewIsSelected = Node->Tabs.SelectedTabView == View;
+                                string8 Label = View->Name;
+                                
+                                UISetNextChildLayoutAxis(AXIS2_Y);
+                                B8 IsChangingDockBoundaries = 0;
+                                ui_box *TabColumnBox = UIMakeBoxFromStringFmt(!IsChangingDockBoundaries * UI_BOX_FLAG_ANIMATE_POS_X,
+                                                                              Str8Lit("TabColumn_%p"), View);
+                                
+                                UIParent(TabColumnBox) UIPrefHeight(UIPX(TabBarVHeight, 1.0f))
+                                {
+                                    if(ViewIsSelected) UISpacer(UIPX(1.0f, 1.0f));
+                                    else UISpacer(UIPX(TabBarRVDiff, 1.0f));
+                                    
+                                    vec4_f32 BGColor = GFRGBAFromThemeColor(ViewIsSelected ? GF_THEME_COLOR_TAB_ACTIVE :
+                                                                            GF_THEME_COLOR_TAB_INACTIVE);
+                                    // Focus tab view if its painting state is the selected one
+                                    if(ViewIsSelected && GFCoreState->CurrentPaintingState &&
+                                       GFCoreState->CurrentPaintingState->Canvas == View)
+                                    {
+                                        BGColor.W *= 2.0f;
+                                    }
+                                    
+                                    UISetNextBackgroundColor(BGColor);
+                                    UISetNextBorderColor(Mix4F32(BGColor, Vec4F32(1.0f, 1.0f, 1.0f, 0.2f), 0.5f));
+                                    ui_box *TabBox = UIMakeBoxFromStringFmt(UI_BOX_FLAG_DRAW_HOT_EFFECTS | UI_BOX_FLAG_DRAW_BACKGROUND |
+                                                                            UI_BOX_FLAG_DRAW_BORDER | UI_BOX_FLAG_CLICKABLE |
+                                                                            UI_BOX_FLAG_ANIMATE_POS_Y, Str8Lit("Tab_%p"), View);
+                                    
+                                    // Build tab contents
+                                    UIParent(TabBox)
+                                    {
+                                        UIWidthFill UIRow
+                                        {
+                                            vec4_f32 TextColor = GFRGBAFromThemeColor(ViewIsSelected ? GF_THEME_COLOR_PLAIN_TEXT :
+                                                                                      GF_THEME_COLOR_WEAK_TEXT);
+                                            UISetNextTextColor(TextColor);
+                                            UISetNextPrefWidth(UITextDim(10.0f, 0.0f));
+                                            UISetNextTextPadding(4.0f);
+                                            UILabel(Label);
+                                        }
+                                        
+                                        UIPrefWidth(UIEM(2.35f, 1.0f)) UITextAlignment(UI_TEXT_ALIGNMENT_TYPE_CENTER)
+                                            UIFont(UIIconFont())
+                                            UIFontSize(GFFontSizeFromPoints(Window->OSWindow, GFState->MainFontPoints) * 0.75f)
+                                            UIBackgroundColor(Vec4F32(0.0f, 0.0f, 0.0f, 0.0f))
+                                            UICornerRadius0(0.0f)
+                                            UICornerRadius1(0.0f)
+                                        {
+                                            ui_signal Signal = UIButtonFmt(Str8Lit("%.*s###CloseView_%p"),
+                                                                           Str8VArg(GFIconFromKind(GF_ICON_KIND_CLOSE)),
+                                                                           View); // TODO: Icons?
+                                            if(Signal.Flags & UI_SIGNAL_FLAGS_LEFT_PRESSED || Signal.Flags & UI_SIGNAL_FLAGS_MIDDLE_PRESSED)
+                                            {
+                                                gf_cmd_params Params = {0};
+                                                Params.Window = (gf_handle)Window;
+                                                Params.Dock = Node;
+                                                Params.View = View;
+                                                GFPushCmdRoot(&Params, GF_CMD_KIND_CLOSE_TAB);
+                                            }
+                                        }
+                                    }
+                                    
+                                    ui_signal Signal = UISignalFromBox(TabBox);
+                                    if(Signal.Flags & UI_SIGNAL_FLAGS_LEFT_PRESSED)
+                                    {
+                                        if(View->Kind == UI_VIEW_KIND_CONTENT)
+                                            GFCoreState->CurrentPaintingState = GFPaintingStateFromView(View);
+                                        NextSelectedTabView = View;
+                                    }
+                                    else if(Signal.Flags & UI_SIGNAL_FLAGS_LEFT_DRAGGING && Length2F32(UIDragDelta()) > 10.0f)
+                                    {
+                                        gf_drag_drop_payload Payload = {0};
+                                        Payload.Key = Signal.Box->Key;
+                                        Payload.DockNode = Node;
+                                        Payload.View = View;
+                                        GFDragBegin(&Payload);
+                                    }
+                                    else if(Signal.Flags & UI_SIGNAL_FLAGS_MIDDLE_PRESSED)
+                                    {
+                                        gf_cmd_params Params = {0};
+                                        Params.Window = (gf_handle)Window;
+                                        Params.Dock = Node;
+                                        Params.View = View;
+                                        GFPushCmdRoot(&Params, GF_CMD_KIND_CLOSE_TAB);
+                                    }
+                                }
+                                
+                                if(View->Next)
+                                    UISpacer(UIEM(0.15f, 1.0f));
+                                
+                                DropSites[ViewIndex].P = TabColumnBox->Rect.Left - TabSpacing / 2.0f;
+                                DropSites[ViewIndex].PrevView = View->Prev;
+                                DropSiteMaxP = Max(TabColumnBox->Rect.Right, DropSiteMaxP);
+                            }
+                            
+                            DropSites[DropSiteCount - 1].P = DropSiteMaxP;
+                            DropSites[DropSiteCount - 1].PrevView = Node->Tabs.LastTabView;
+                            
+                            // Precise drop sites on tab bar
+                            {
+                                vec2_f32 Mouse = UIMouse();
+                                ui_view *View = GFState->DragDropPayload.View;
+                                rng2_f32 DropRect = DockRect;
+                                DropRect.Bottom = DropRect.Top + UITopFontSize() * 20.0f;
+                                if(ActiveDrag && WindowIsFocused && Contains2F32(DropRect, Mouse) && View)
+                                {
+                                    F32 MinDistance = 0;
+                                    drop_site *ActiveDropSite = 0;
+                                    if(CatchallDropSiteHovered)
+                                    {
+                                        for(U32 DropSiteIndex = 0; DropSiteIndex < DropSiteCount; ++DropSiteIndex)
+                                        {
+                                            F32 Distance = AbsF32(DropSites[DropSiteIndex].P - Mouse.X);
+                                            if(DropSiteIndex == 0 || Distance < MinDistance)
+                                            {
+                                                ActiveDropSite = &DropSites[DropSiteIndex];
+                                                MinDistance = Distance;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Store closest prev view
+                                    if(ActiveDropSite)
+                                        GFState->LastDragDropPrevTab = ActiveDropSite->PrevView;
+                                    else
+                                        GFState->LastDragDropPrevTab = 0;
+                                    
+                                    // Vis
+                                    ui_dock_node *DragDock = GFState->DragDropPayload.DockNode;
+                                    if(View && ActiveDropSite)
+                                    {
+                                        TopBarBox->Flags |= UI_BOX_FLAG_DRAW_OVERLAY;
+                                        TopBarBox->OverlayColor = GFRGBAFromThemeColor(GF_THEME_COLOR_DROP_SITE_OVERLAY);
+                                    }
+                                    
+                                    gf_drag_drop_payload Payload = GFState->DragDropPayload;
+                                    if(CatchallDropSiteHovered && (ActiveDropSite && GFDragDrop(&Payload)))
+                                    {
+                                        ui_view *View = Payload.View;
+                                        ui_dock_node *SrcNode = Payload.DockNode;
+                                        if(Node && View)
+                                        {
+                                            gf_cmd_params Params = {0};
+                                            Params.Window = (gf_handle)Window;
+                                            Params.Dock = SrcNode;
+                                            Params.DestDock = Node;
+                                            Params.View = View;
+                                            Params.PrevView = ActiveDropSite->PrevView;
+                                            GFPushCmdRoot(&Params, GF_CMD_KIND_MOVE_TAB);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Node->Tabs.SelectedTabView = NextSelectedTabView;
+                    ReleaseScratch(Scratch);
+                }
+                else
+                {
+                    ui_signal Signal = UISignalFromBox(TopBarBox);
+                    if(Signal.Flags & UI_SIGNAL_FLAGS_LEFT_DRAGGING && Length2F32(UIDragDelta()) > 10.0f)
+                    {
+                        gf_drag_drop_payload Payload = {0};
+                        Payload.Key = Signal.Box->Key;
+                        Payload.DockNode = Node;
+                        Payload.View = Node->Tabs.FirstTabView;
+                        GFDragBegin(&Payload);
+                    }
+                }
+                
+                if(CatchallDropSiteHovered)
+                {
+                    GFState->LastDragDropDock = Node;
+                }
+            }
+        }
+        
+        // The content dock and its children needs to be rendered last, which this code does.
+        ui_dock_node *PrevNode = Node;
+        Node = UIGetDockNodeRecursionPre(Node);
+        if(Node == 0) Node = Window->RootDockNode;
+        else if(Node == Window->RootDockNode->Next && UIDockingIsCentralNodeChild(PrevNode)) break;
+    }
+
+    // Animate views
+    {
+        F32 Rate = 1.0f - PowF32(2.0f, (-10.0f * GFState->Delta));
+        F32 FastRate = 1.0f - PowF32(2.0f, (-40.0f * GFState->Delta));
+        for(ui_dock_node *Node = Window->RootDockNode; Node; Node = UIGetDockNodeRecursionPre(Node))
+        {
+            for(ui_view *View = Node->Tabs.FirstTabView; View; View = View->Next)
+            {
+                View->ScrollPos.X.Offset -= View->ScrollPos.X.Offset * FastRate;
+                View->ScrollPos.Y.Offset -= View->ScrollPos.Y.Offset * FastRate;
+                if(AbsF32(View->ScrollPos.X.Offset) < 0.01f) View->ScrollPos.X.Offset = 0.0f;
+                if(AbsF32(View->ScrollPos.Y.Offset) < 0.01f) View->ScrollPos.Y.Offset = 0.0f;
+            }
+        }
+    }
+    
+    UIEndAnimation();
+    UIEndBuild();
+    
+    // Render the UI
+    Window->Bucket = RndMakeBucket(GFState->FrameArena);
+    RndBucketScope(Window->Bucket)
+    {
+        temp_arena Scratch = GetScratch(0, 0);
+        
+        // Draw background color
+        {
+            vec4_f32 BackgroundColor = GFRGBAFromThemeColor(GF_THEME_COLOR_PLAIN_BACKGROUND);
+            RndRect(OSClientRectFromWindow(Window->OSWindow), BackgroundColor, 0.0f, 0.0f, 0.0f);
+        }
+        
+        for(ui_box *Box = UIGetBoxRootFromState(Window->UI), *NextBox; Box; Box = NextBox)
+        {
+            ui_box_rec Rec = UIGetBoxRecursionPost(Box);
+            NextBox = Rec.Next;
+            
+            if(Box->Squish != 0.0f)
+            {
+                vec2_f32 BoxDim = Dim2F32(Box->Rect);
+                mat3x3_f32 BoxToOriginTransform = Translate3x3F32(Vec2F32(-Box->Rect.Right - BoxDim.X / 8, -Box->Rect.Top));
+                mat3x3_f32 ScaleTransform = Scale3x3F32(Vec2F32(1.0f - Box->Squish, 1.0f - Box->Squish));
+                mat3x3_f32 OriginToBoxTransform = Translate3x3F32(Vec2F32(Box->Rect.Right + BoxDim.X / 8, Box->Rect.Top));
+                mat3x3_f32 Transform = Mul3x3F32(OriginToBoxTransform, Mul3x3F32(ScaleTransform, BoxToOriginTransform));
+                RndPushTransform(Transform);
+                RndPushSamplerKind(RND_TEX2D_SAMPLER_KIND_LINEAR);
+            }
+            
+            if(Box->Flags & UI_BOX_FLAG_DRAW_BACKGROUND)
+            {
+                {
+                    rnd_rect2d_inst *Inst = RndRect(Pad2F32(Box->Rect, 1.5f), Box->BackgroundColor, 0.0f, 0.0f, 1.0f);
+                    MemoryCopy(Inst->CornerRadii.V, Box->CornerRadii, sizeof(Box->CornerRadii));
+                }
+                
+                if(Box->Flags & UI_BOX_FLAG_DRAW_HOT_EFFECTS)
+                {
+                    F32 EffectiveActiveT = Box->ActiveT;
+                    if(!(Box->Flags & UI_BOX_FLAG_DRAW_ACTIVE_EFFECTS))
+                        EffectiveActiveT = 0;
+                    F32 Time = Box->HotT * (1 - EffectiveActiveT);
+                    
+                    // Brighten
+                    {
+                        rnd_rect2d_inst *Inst = RndRect(Box->Rect, Vec4F32(1.0f, 0.9f, 0.7f, 0.1f * Time), 0.0f, 0.0f, 1.0f);
+                        MemoryCopy(Inst->CornerRadii.V, Box->CornerRadii, sizeof(Box->CornerRadii));
+                    }
+                    
+                    // Slight emboss fadeoff
+                    {
+                        rnd_rect2d_inst *Inst = RndRect(Box->Rect, Vec4F32(0.0f, 0.0f, 0.0f, 0.0f), 0.0f, 0.0f, 1.0f);
+                        Inst->Colors[0] = Vec4F32(0.0f, 0.0f, 0.0f, 0.3f * Time);
+                        Inst->Colors[1] = Vec4F32(0.0f, 0.0f, 0.0f, 0.0f * Time);
+                        Inst->Colors[2] = Vec4F32(0.0f, 0.0f, 0.0f, 0.3f * Time);
+                        Inst->Colors[3] = Vec4F32(0.0f, 0.0f, 0.0f, 0.0f * Time);
+                        MemoryCopy(Inst->CornerRadii.V, Box->CornerRadii, sizeof(Box->CornerRadii));
+                    }
+                    
+                    if(Box->Flags & UI_BOX_FLAG_DRAW_ACTIVE_EFFECTS)
+                    {
+                        rnd_rect2d_inst *Inst = RndRect(Pad2F32(Box->Rect, 1.5f), GFRGBAFromThemeColor(GF_THEME_COLOR_HIGHLIGHT),
+                                                        0.0f, 0.0f, 1.0f);
+                        MemoryCopy(Inst->CornerRadii.V, Box->CornerRadii, sizeof(Box->CornerRadii));
+                        Inst->Colors[0].A *= Box->ActiveT;
+                        Inst->Colors[1].A *= Box->ActiveT;
+                        Inst->Colors[2].A *= Box->ActiveT;
+                        Inst->Colors[3].A *= Box->ActiveT;
+                    }
+                }
+            }
+            
+            if(Box->Flags & UI_BOX_FLAG_DRAW_TEXT)
+            {
+                vec2_f32 TextPosition = UIBoxTextPosition(Box);
+                F32 MaxX = (Box->Rect.Right - TextPosition.X);
+                font_run EllipsesRun = FontPushRunFromString(Scratch.Arena, Box->Font, Box->FontSize, Str8Lit("..."));
+                
+                RndTruncatedFancyRunList(TextPosition, &Box->StringRun, MaxX, EllipsesRun);
+            }
+            
+            if(Box->Flags & UI_BOX_FLAG_CLIP)
+            {
+                rng2_f32 TopClip = RndTopClip();
+                rng2_f32 NewClip = Pad2F32(Box->Rect, -1.0f);
+                if(TopClip.Right != 0.0f || TopClip.Bottom != 0.0f)
+                    NewClip = Intersect2F32(NewClip, TopClip);
+                RndPushClip(NewClip);
+            }
+            
+            if(Box->Flags & UI_BOX_FLAG_DRAW_BUCKET)
+            {
+                RndSubBucket(Box->RndBucket);
+            }
+            
+            U32 PopIndex = 0;
+            for(ui_box *B = Box; B && PopIndex++ <= Rec.PopCount; B = B->Parent)
+            {
+                if(B == Box && Rec.PushCount) continue;
+                
+                if(B->Flags & UI_BOX_FLAG_CLIP)
+                {
+                    RndPopClip();
+                }
+                
+                if(B->Flags & UI_BOX_FLAG_DRAW_BORDER)
+                {
+                    rnd_rect2d_inst *Inst = RndRect(Pad2F32(B->Rect, 1.0f), B->BorderColor, 0.0f, 1.0f, 1.0f);
+                    MemoryCopy(Inst->CornerRadii.V, B->CornerRadii, sizeof(B->CornerRadii));
+                    
+                    if(B->Flags & UI_BOX_FLAG_DRAW_HOT_EFFECTS)
+                    {
+                        rnd_rect2d_inst *Inst = RndRect(Pad2F32(B->Rect, 1.0f), Vec4F32(1.0f, 1.0f, 1.0f, 0.5f * B->HotT),
+                                                        0.0f, 1.0f, 1.0f);
+                        MemoryCopy(Inst->CornerRadii.V, B->CornerRadii, sizeof(B->CornerRadii));
+                    }
+                }
+                
+                if(B->Flags & UI_BOX_FLAG_DRAW_BORDER_FOCUS)
+                {
+                    vec4_f32 Color = GFRGBAFromThemeColor(GF_THEME_COLOR_BORDER_HIGHLIGHT);
+                    rnd_rect2d_inst *Inst = RndRect(Pad2F32(B->Rect, 1.0f), Color, 0.0f, 2.0f, 1.0f);
+                    Inst->Colors[0] = Inst->Colors[2] = Inst->Colors[3] = Vec4F32(Color.X, Color.Y, Color.Z, Color.W / 3.0f);
+                    MemoryCopy(Inst->CornerRadii.V, B->CornerRadii, sizeof(B->CornerRadii));
+                }
+                
+                if(B->Flags & UI_BOX_FLAG_DRAW_OVERLAY && B->OverlayColor.W > 0.005f)
+                {
+                    rnd_rect2d_inst *Inst = RndRect(B->Rect, B->OverlayColor, 0.0f, 0.0f, 1.0f);
+                    MemoryCopy(Inst->CornerRadii.V, B->CornerRadii, sizeof(B->CornerRadii));
+                }
+                
+                if(Box->Squish != 0.0f)
+                {
+                    RndPopTransform();
+                    RndPopSamplerKind();
+                }
+            }
+        }
+        
+        ReleaseScratch(Scratch);
+    }
+    
+    if(Window->FramesAlive++ == 0)
+        OSWindowFirstPaint(Window->OSWindow);
+    
+    Window->LastWindowRect = WindowRect;
+    Window->LastDPI = OSDPIFromWindow(Window->OSWindow);
+}
+
+vec4_f32 GFRGBAFromThemeColor(gf_theme_color Color)
+{
+    return GFState->ThemeColors[Color];
+}
+
+string8 GFIconFromKind(gf_icon_kind Kind)
+{
+    return GFIconKindTextList[Kind];
+}

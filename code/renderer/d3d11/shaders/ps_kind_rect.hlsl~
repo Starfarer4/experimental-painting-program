@@ -1,0 +1,72 @@
+/*  =======================================================================
+    File: ps_kind_rect.hlsl
+    Date: March 9th 2024  2:38 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+
+cbuffer uniform_buffer : register(b0)
+{
+    float2 Resolution;
+    float2 TexSize;
+    float4x4 TextureSampleChannelMap;
+    float4x4 Transform;
+    float2 TransformScale;
+};
+
+struct ps_input
+{
+    float2 TexCoord : TEXCOORD;
+    float4 Color : COLOR;
+    float CornerRadius : CORNERRAD;
+    float2 SDFSamplePos : SDFSAMPLEPOS;
+    nointerpolation float2 HalfSize : HALFSIZE;
+    nointerpolation float BorderThickness : BORDERTHICKNESS;
+    nointerpolation float Softness : SOFTNESS;
+    nointerpolation float WhiteTextureOverride : WHITEOVERRIDE;
+    float4 Position : SV_POSITION;
+};
+
+Texture2D Texture : register(t0);
+SamplerState Sampler : register(s0);
+
+float RectSDF(float2 SamplePos, float2 RectHalfSize, float Radius)
+{
+    return length(max(abs(SamplePos) - RectHalfSize + Radius, 0)) - Radius;
+}
+
+float4 main(ps_input Input) : SV_TARGET
+{
+    float4 Color = Input.Color;
+    
+    float4 AlbedoSample = float4(1, 1, 1, 1);
+    if(Input.WhiteTextureOverride < 1)
+        AlbedoSample = clamp(mul(Texture.Sample(Sampler, Input.TexCoord), TextureSampleChannelMap), 0, 1);
+
+    float2 SDFSamplePos = Input.SDFSamplePos;
+
+    float BorderSDFT = 1;
+    if(Input.BorderThickness > 0)
+    {
+        float BorderSDFS = RectSDF(SDFSamplePos,
+                                   Input.HalfSize - float2(Input.Softness * 2, Input.Softness * 2) - Input.BorderThickness,
+                                   max(Input.CornerRadius - Input.BorderThickness, 0));
+        BorderSDFT = smoothstep(0, 2 * Input.Softness, BorderSDFS);
+    }
+    if(BorderSDFT < 0.001f)
+        discard;
+
+    float CornerSDFT = 1;
+    if(Input.CornerRadius > 0 || Input.Softness > 0.75)
+    {
+        float CornerSDFS = RectSDF(SDFSamplePos,
+                                   Input.HalfSize - float2(Input.Softness * 2, Input.Softness * 2),
+                                   Input.CornerRadius);
+        CornerSDFT = 1 - smoothstep(0, 2 * Input.Softness, CornerSDFS);
+    }
+
+    float4 FinalColor = AlbedoSample;
+    FinalColor *= Color;
+    FinalColor.a *= CornerSDFT;
+    FinalColor.a *= BorderSDFT;
+    return FinalColor;
+}

@@ -1,0 +1,253 @@
+/*  =======================================================================
+    File: brush_core.c
+    Date: June 17th 2024 12:30 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+
+typedef struct br_state br_state;
+struct br_state
+{    
+    arena *Arena;
+};
+
+global_variable br_state *BRState = 0;
+
+void BRDrawBrushComputedPlot(br_brush *Brush, im_image *Image, vec2_f32 PlotLocation, F32 Turns, vec4_f32 BrushColor, F32 Flow, F32 Size)
+{
+    temp_arena Scratch = GetScratch(0, 0);
+
+    //Size = CeilF32(Size);
+    
+    F32 Hardness = 0.05f + Brush->ComputedTip.Hardness * 0.85f;
+    F32 Roundness = Max(0.01f, Brush->ComputedTip.Roundness);
+    
+    vec2_f32 BoundingCenter = Vec2F32(CeilF32(Size), CeilF32(Size));
+    vec2_f32 BoundingSize = Mul2F32(BoundingCenter, Vec2F32(2.0f, 2.0f));
+
+    vec2_f32 TopLeftStartF32 = Sub2F32(PlotLocation, BoundingCenter);
+    vec2_i32 TopLeftStart = Vec2I32((I32)FloorF32(TopLeftStartF32.X), (I32)FloorF32(TopLeftStartF32.Y));
+
+    F32 Radius = (Size / 2.0f) * Hardness;
+    F32 ExtendedRadius = (Size / 2.0f) * (2.0f - Hardness);
+    
+    vec2_f32 PlotOffset = Sub2F32(PlotLocation, Vec2F32(FloorF32(PlotLocation.X), FloorF32(PlotLocation.Y)));
+
+    F32 CosAngle = CosF32(Turns);
+    F32 SinAngle = SinF32(Turns);
+    
+    // Rasterize the brush shape
+    F32 *Raster = PushArrayNoZero(Scratch.Arena, F32, (I32)BoundingSize.X * (I32)BoundingSize.Y);
+    for(I32 Width = 0; Width < BoundingSize.X; ++Width)
+    {
+        for(I32 Height = 0; Height < BoundingSize.Y; ++Height)
+        {
+            // Calculate the rotated position for the ellipse
+            vec2_f32 RotPoint = Vec2F32((Width - BoundingCenter.X) * CosAngle + (Height - BoundingCenter.Y) * SinAngle + BoundingCenter.X,
+                                        -(Width - BoundingCenter.X) * SinAngle + (Height - BoundingCenter.Y) * CosAngle + BoundingCenter.Y);
+
+            // Calculate the SDF of the brush
+            F32 Distance = 0.0f;
+            {
+                vec2_f32 Distance2F32 = Div2F32(Sub2F32(RotPoint, BoundingCenter), Vec2F32(Radius, Radius * Roundness));
+                Distance = (Length2F32(Distance2F32) - 1.0f) * Radius;
+            }
+            
+            F32 Opacity = 1.0f;
+            if(Distance > 0.0f)
+            {
+                F32 Sigma = ExtendedRadius * (1.0f - Hardness) / 4.0f;
+                Opacity = ExpF32(-(Distance * Distance) / (2.0f * Sigma * Sigma));
+            }
+
+            Raster[Width + (I32)BoundingSize.X * Height] = Opacity;
+        }
+    }
+
+    // Interpolate the rasterized brush for more precise result
+    for(I32 Width = 0; Width < BoundingSize.X; ++Width)
+    {
+        I32 BrushImageX = TopLeftStart.X + (Brush->ComputedTip.FlipX ? ((I32)BoundingSize.X - Width - 1) : Width);
+        for(I32 Height = 0; Height < BoundingSize.Y; ++Height)
+        {
+            I32 BrushImageY = TopLeftStart.Y + (Brush->ComputedTip.FlipY ? ((I32)BoundingSize.Y - Height - 1) : Height);
+            if(BrushImageX >= (I32)Image->Result.Width || BrushImageY >= (I32)Image->Result.Height ||
+               BrushImageX < 0 || BrushImageY < 0)
+            {
+                continue;
+            }
+
+            vec2_f32 PixelPos = Sub2F32(Vec2F32((F32)Width, (F32)Height), PlotOffset);
+
+            // Calculate the opacity with billinear interpolation
+            F32 Opacity = 0.0f;
+            {
+                I32 x0 = (I32)FloorF32(PixelPos.X);
+                I32 x1 = x0 + 1;
+                I32 y0 = (I32)FloorF32(PixelPos.Y);
+                I32 y1 = y0 + 1;
+
+                x0 = Clamp(0, x0, (I32)BoundingSize.X - 1);
+                x1 = Clamp(0, x1, (I32)BoundingSize.X - 1);
+                y0 = Clamp(0, y0, (I32)BoundingSize.Y - 1);
+                y1 = Clamp(0, y1, (I32)BoundingSize.Y - 1);
+
+                F32 Ia = Raster[(x0 + (I32)BoundingSize.X * y0)];
+                F32 Ib = Raster[(x0 + (I32)BoundingSize.X * y1)];
+                F32 Ic = Raster[(x1 + (I32)BoundingSize.X * y0)];
+                F32 Id = Raster[(x1 + (I32)BoundingSize.X * y1)];
+
+                F32 wa = (x1 - PixelPos.X) * (y1 - PixelPos.Y);
+                F32 wb = (x1 - PixelPos.X) * (PixelPos.Y - y0);
+                F32 wc = (PixelPos.X - x0) * (y1 - PixelPos.Y);
+                F32 wd = (PixelPos.X - x0) * (PixelPos.Y - y0);
+
+                Opacity = wa * Ia + wb * Ib + wc * Ic + wd * Id;
+            }
+
+            // render the brush stroke to a temporary layer for opacity blending
+            U8 *ScratchLoc = Image->ScratchLayer.Pixels + (BrushImageX + Image->ScratchLayer.Width * BrushImageY) * 4;
+            {
+                F32 AlphaFg = Opacity * Flow;
+                F32 AlphaBg = ScratchLoc[3] / 255.0f;
+                F32 AlphaOut = AlphaFg + AlphaBg * (1.0f - AlphaFg);
+                if(AlphaOut > 0.0f)
+                {
+                    ScratchLoc[0] = (U8)(((AlphaFg * BrushColor.R * 255.0f) + (AlphaBg * ScratchLoc[0] * (1.0f - AlphaFg))) / AlphaOut);
+                    ScratchLoc[1] = (U8)(((AlphaFg * BrushColor.G * 255.0f) + (AlphaBg * ScratchLoc[1] * (1.0f - AlphaFg))) / AlphaOut);
+                    ScratchLoc[2] = (U8)(((AlphaFg * BrushColor.B * 255.0f) + (AlphaBg * ScratchLoc[2] * (1.0f - AlphaFg))) / AlphaOut);
+                    ScratchLoc[3] = (U8)(Max(AlphaOut * BrushColor.A, AlphaBg) * 255.0f); // opacity blending
+                }
+                else
+                {
+                    ScratchLoc[0] = 0;
+                    ScratchLoc[1] = 0;
+                    ScratchLoc[2] = 0;
+                    ScratchLoc[3] = 0;
+                }
+            }
+
+            U8 *ResultLoc = Image->Result.Pixels + (BrushImageX + Image->Result.Width * BrushImageY) * 4;
+            U8 *LayerLoc = Image->Layer.Pixels + (BrushImageX + Image->Layer.Width * BrushImageY) * 4;
+            {        
+                F32 AlphaFg = ScratchLoc[3] / 255.0f;
+                F32 AlphaBg = LayerLoc[3] / 255.0f;
+                F32 AlphaOut = AlphaFg + AlphaBg * (1.0f - AlphaFg);
+                if(AlphaOut > 0.0f)
+                {
+                    ResultLoc[0] = (U8)(((AlphaFg * ScratchLoc[0]) + (AlphaBg * LayerLoc[0] * (1.0f - AlphaFg))) / AlphaOut);
+                    ResultLoc[1] = (U8)(((AlphaFg * ScratchLoc[1]) + (AlphaBg * LayerLoc[1] * (1.0f - AlphaFg))) / AlphaOut);
+                    ResultLoc[2] = (U8)(((AlphaFg * ScratchLoc[2]) + (AlphaBg * LayerLoc[2] * (1.0f - AlphaFg))) / AlphaOut);
+                    ResultLoc[3] = (U8)(AlphaOut * 255.0f);
+                }
+                else
+                {
+                    ResultLoc[0] = 0;
+                    ResultLoc[1] = 0;
+                    ResultLoc[2] = 0;
+                    ResultLoc[3] = 0;
+                }
+            }
+        }
+    }
+
+    ReleaseScratch(Scratch);
+}
+
+void BRStartState()
+{
+    arena *Arena = ArenaAlloc(Megabytes(4));
+    BRState = PushStruct(Arena, br_state);
+    BRState->Arena = Arena;
+}
+
+void BRAddBrushStroke(br_brush *Brush, im_image *Image, vec2_f32 Location, F32 CanvasTurns, F32 Pressure)
+{
+    B8 BrushJustPlaced = 0;
+    if(Brush->CurrentImage == 0)
+    {
+        Brush->CurrentImage = Image;
+        Brush->LastBrushPosition = Location;
+        Brush->LastBrushPressure = Pressure;
+        Brush->LastBrushSize = 0.0f;
+        BrushJustPlaced = 1;
+    }
+    
+    if(Brush->CurrentImage == Image)
+    {
+        if(BrushJustPlaced || Brush->LastBrushPosition.X != Location.X || Brush->LastBrushPosition.Y != Location.Y ||
+           Brush->LastBrushPressure != Pressure)
+        {
+            F32 Roundness = Max(0.01f, Brush->ComputedTip.Roundness);
+            vec2_f32 StepVector = Sub2F32(Brush->LastBrushPosition, Location);
+            F32 DistanceToFill = Length2F32(StepVector);
+            
+            for(F32 FilledDistance = DistanceToFill;;)
+            {
+                F32 CurrentPressure = Mix1F32(Pressure, Brush->LastBrushPressure, DistanceToFill ? (FilledDistance / DistanceToFill) : 0.0f);
+                F32 Size = Brush->SizePx;
+
+                if(Brush->ShapeDynamics.Enabled)
+                {
+                    F32 SizePressure = Max(Brush->ShapeDynamics.MinimumDiameter, CurrentPressure);
+                    if(Brush->ShapeDynamics.SizeControl == BR_CONTROL_TYPE_PEN_PRESSURE) Size *= SizePressure;
+
+                    Size -= Size * Brush->ShapeDynamics.SizeJitter * RandNextF32();
+                    Size = Max(Size, 1.0f);
+                }
+
+                F32 StepDistance = BrushJustPlaced ? 0.0f : (Size / 2.0f + Brush->LastBrushSize / 2.0f) * Roundness * Brush->SpacingPct;
+                Brush->LastBrushSize = Size;
+                vec2_f32 Step = DistanceToFill == 0.0f ? Vec2F32(0.0f, 0.0f) :
+                    Mul2F32(Div2F32(StepVector, Vec2F32(DistanceToFill, DistanceToFill)), Vec2F32(StepDistance, StepDistance));
+                FilledDistance -= StepDistance;
+
+                if(BrushJustPlaced) BrushJustPlaced = 0;
+                else if(FilledDistance <= 0.0f) break;
+                
+                Brush->LastBrushPosition = Sub2F32(Brush->LastBrushPosition, Step);
+
+                F32 Opacity = 1.0f;
+                F32 Flow = 1.0f;
+                if(Brush->Transfer.Enabled)
+                {
+                    F32 OpacityPressure = Max(Brush->Transfer.OpacityControlMinimum, CurrentPressure);
+                    F32 FlowPressure = Max(Brush->Transfer.FlowControlMinimum, CurrentPressure);
+                    if(Brush->Transfer.OpacityControl == BR_CONTROL_TYPE_PEN_PRESSURE) Opacity *= OpacityPressure;
+                    if(Brush->Transfer.FlowControl == BR_CONTROL_TYPE_PEN_PRESSURE) Flow *= FlowPressure;
+
+                    Opacity -= Opacity * Brush->Transfer.OpacityJitter * RandNextF32();
+                    Flow -= Flow * Brush->Transfer.FlowJitter * RandNextF32();
+                }
+
+                switch(Brush->TipKind)
+                {
+                    case BR_TIP_KIND_COMPUTED:
+                    {
+                        BRDrawBrushComputedPlot(Brush, Image, Brush->LastBrushPosition, CanvasTurns - (Brush->ComputedTip.Angle / 360.0f),
+                                                Vec4F32(1.0f, 1.0f, 1.0f, Opacity), Flow, Size);
+                    }break;
+
+                    case BR_TIP_KIND_BRISTLE:
+                    {
+                    }break;
+                    
+                }
+            }
+            
+            IMUpdateImage(Image);
+
+            Brush->LastBrushPressure = Pressure;
+        }
+    }
+}
+
+void BRResetDraw(br_brush *Brush, im_image *Image)
+{
+    if(Brush->CurrentImage == Image)
+    {
+        U32 Size = Image->Result.Width * Image->Result.Height * 4;
+        MemoryCopy(Image->Layer.Pixels, Image->Result.Pixels, Size);
+        MemoryZero(Image->ScratchLayer.Pixels, Size);
+        Brush->CurrentImage = 0;
+    }
+}

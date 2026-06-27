@@ -1,0 +1,196 @@
+/*  =======================================================================
+    File: image_core.c
+    Date: May 15th 2024  3:30 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+
+// TODO: Abstract this into a platform specific file!!!
+im_image_loader_error IMLoadImageWICPre(string8 Path, im_image *Image)
+{    
+    IWICImagingFactory2 *WICFactory = 0;
+    IWICBitmapDecoder *Decoder = 0;
+    IWICBitmapFrameDecode *Frame = 0;
+    IWICFormatConverter *Converter = 0;
+    
+    HRESULT Error = 0;
+
+    im_image_loader_error Result = IM_IMAGE_LOADER_ERROR_SUCCESS;
+    
+    // Create WIC factory
+    CoInitialize(0);
+    Error = CoCreateInstance(&CLSID_WICImagingFactory, 0, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&WICFactory);
+    if(SUCCEEDED(Error))
+    {
+        // Create decoder
+        temp_arena Scratch = GetScratch(0, 0);
+        string16 Path16 = Str16From8(Scratch.Arena, Path);
+        Error = IWICImagingFactory2_CreateDecoderFromFilename(WICFactory, Path16.String, 0, GENERIC_READ,
+                                                              WICDecodeMetadataCacheOnDemand, &Decoder);
+        ReleaseScratch(Scratch);
+
+        if(SUCCEEDED(Error))
+            Error = IWICBitmapDecoder_GetFrame(Decoder, 0, &Frame);
+        if(SUCCEEDED(Error))
+            Error = IWICImagingFactory2_CreateFormatConverter(WICFactory, &Converter);
+        if(SUCCEEDED(Error))
+        {
+            Error = IWICFormatConverter_Initialize(Converter, (IWICBitmapSource *)Frame, &GUID_WICPixelFormat32bppRGBA,
+                                                   WICBitmapDitherTypeNone, 0, 0.0, WICBitmapPaletteTypeCustom);
+        }
+
+        // Decode the image data
+        U8 *Data = 0;
+        U32 Width, Height;
+        if(SUCCEEDED(Error))
+        {
+            IWICFormatConverter_GetSize(Converter, &Width, &Height);
+        
+            U64 ImageSize = Width * Height * 4;
+            Data = OSReserve(ImageSize);
+            OSCommit(Data, ImageSize);
+            
+            IWICFormatConverter_CopyPixels(Converter, 0, Width * 4, Width * Height * 4, Data);
+
+            // TODO: Settings exif??
+        }
+
+        if(FAILED(Error) || Data == 0)
+        {
+            if(Error == WINCODEC_ERR_COMPONENTNOTFOUND || Error == WINCODEC_ERR_COMPONENTINITIALIZEFAILURE)
+                Result = IM_IMAGE_LOADER_ERROR_CODEC_NOT_FOUND;
+            else
+                Result = IM_IMAGE_LOADER_ERROR_UNKNOWN;
+        }
+        else
+        {
+            // TODO: Image has been loaded! Do something with it!! Also ensure there's enough VRAM to load the image.
+            Image->Layer.Width = Width;
+            Image->Layer.Height = Height;
+            Image->Layer.Pixels = Data;
+        }
+
+        if(Frame) IWICBitmapFrameDecode_Release(Frame);
+        if(Decoder) IWICBitmapDecoder_Release(Decoder);
+        if(Converter) IWICFormatConverter_Release(Converter);
+        CoUninitialize();
+    }
+    else
+        Result = IM_IMAGE_LOADER_ERROR_LOADER;
+
+    return Result;
+}
+
+im_image_loader_error IMLoadImage(im_image *Image, string8 Path)
+{
+    im_image_loader_error Result = IMLoadImageWICPre(Path, Image);
+    if(Result == IM_IMAGE_LOADER_ERROR_SUCCESS)
+    {
+        Image->Texture = RndTex2DAlloc(RND_TEX2D_KIND_TEMPORARY, Vec2I32((I32)Image->Layer.Width, (I32)Image->Layer.Height),
+                                       RND_TEX2D_FORMAT_RGBA8, Image->Layer.Pixels);
+        if(Image->ImageMutex == 0) Image->ImageMutex = OSMutexAlloc();
+        
+        Image->ScratchLayer.Width = Image->Result.Width = Image->Layer.Width;
+        Image->ScratchLayer.Height = Image->Result.Height = Image->Layer.Height;
+        
+        U64 ImageSize = Image->Layer.Width * Image->Layer.Height * 4;
+        Image->ScratchLayer.Pixels = OSReserve(ImageSize);
+        OSCommit(Image->ScratchLayer.Pixels, ImageSize);
+        Image->Result.Pixels = OSReserve(ImageSize);
+        OSCommit(Image->Result.Pixels, ImageSize);
+
+        MemoryCopy(Image->Result.Pixels, Image->Layer.Pixels, ImageSize);
+    }
+    return Result;
+}
+
+void IMDeleteImage(im_image *Image)
+{
+    U64 ImageSize = Image->Result.Width * Image->Result.Height * 4;
+    if(Image->Result.Pixels) OSRelease(Image->Result.Pixels, ImageSize);
+    if(Image->Texture) RndTex2DRelease(Image->Texture);
+    if(Image->ScratchLayer.Pixels) OSRelease(Image->ScratchLayer.Pixels, ImageSize);
+
+    U64 ImageGeneration = Image->Generation + 1;
+    os_handle Mutex = Image->ImageMutex;
+    MemoryZero(Image, sizeof(im_image));
+    Image->Generation = ImageGeneration;
+    Image->ImageMutex = Mutex;
+}
+
+inline void IMUpdateImage(im_image *Image)
+{
+    U64 ImageSize = Image->Result.Width * Image->Result.Height * 4;
+    RndUpdateTex2DResource(Image->Texture, Image->Result.Pixels, ImageSize);
+}
+
+// NOTE: This function is untested!!
+inline U32 IMBilinearInterpolateRGBA8(im_raw_image *Image, vec2_f32 Position)
+{
+    I32 x0 = (I32)FloorF32(Position.X);
+    I32 x1 = x0 + 1;
+    I32 y0 = (I32)FloorF32(Position.Y);
+    I32 y1 = y0 + 1;
+
+    x0 = x0 < 0 ? 0 : (x0 >= (I32)Image->Width ? Image->Width - 1 : x0);
+    x1 = x1 < 0 ? 0 : (x1 >= (I32)Image->Width ? Image->Width - 1 : x1);
+    y0 = y0 < 0 ? 0 : (y0 >= (I32)Image->Height ? Image->Height - 1 : y0);
+    y1 = y1 < 0 ? 0 : (y1 >= (I32)Image->Height ? Image->Height - 1 : y1);
+
+    U32 Result = 0;
+    U8 *ResultBytes = (U8 *)&Result;
+    for(U32 Color = 0; Color < 4; ++Color)
+    {
+        F32 Ia = Image->Pixels[(x0 + Image->Width * y0) * 4 + Color];
+        F32 Ib = Image->Pixels[(x0 + Image->Width * y1) * 4 + Color];
+        F32 Ic = Image->Pixels[(x1 + Image->Width * y0) * 4 + Color];
+        F32 Id = Image->Pixels[(x1 + Image->Width * y1) * 4 + Color];
+
+        F32 wa = (x1 - Position.X) * (y1 - Position.Y);
+        F32 wb = (x1 - Position.X) * (Position.Y - y0);
+        F32 wc = (Position.X - x0) * (y1 - Position.Y);
+        F32 wd = (Position.X - x0) * (Position.Y - y0);
+
+        ResultBytes[Color] = (U8)(wa * Ia + wb * Ib + wc * Ic + wd * Id);
+    }
+
+    return Result;
+}
+
+// NOTE: This function is untested!!
+im_raw_image IMMakeRotatedRawImage(arena *Arena, im_raw_image *Image, F32 Turns)
+{
+    im_raw_image NewImage = {0}; // Allocate the space for the resulting image
+    {
+        F32 FQAngle = FirstQuadF32(Turns);
+        vec2_f32 TopRight = Div2F32(Vec2F32((F32)Image->Width, (F32)Image->Height), Vec2F32(1.0f, 1.0f));
+        TopRight = Vec2F32(TopRight.X * CosF32(-FQAngle) - TopRight.Y * SinF32(-FQAngle),
+                           TopRight.X * SinF32(FQAngle) + TopRight.Y * CosF32(FQAngle));
+
+        vec2_f32 BoundingDimensions = Mul2F32(TopRight, Vec2F32(2.0f, 2.0f));
+        BoundingDimensions = Vec2F32(RoundF32(BoundingDimensions.X), RoundF32(BoundingDimensions.Y));
+
+        NewImage.Width = (U32)BoundingDimensions.X;
+        NewImage.Height = (U32)BoundingDimensions.Y;
+        NewImage.Pixels = PushArray(Arena, U8, NewImage.Width * NewImage.Height * 4);
+    }
+
+    F32 CosAngle = CosF32(Turns);
+    F32 SinAngle = SinF32(Turns);
+
+    vec2_f32 Center = Div2F32(Vec2F32((F32)NewImage.Width, (F32)NewImage.Height), Vec2F32(2.0f, 2.0f));
+
+    for(U32 x = 0; x < NewImage.Width; ++x)
+    {
+        for(U32 y = 0; y < NewImage.Height; ++y)
+        {
+            F32 NewX = (x - Center.X) * CosAngle + (y - Center.Y) * SinAngle + Center.X;
+            F32 NewY = -(x - Center.X) * SinAngle + (y - Center.Y) * CosAngle + Center.Y;
+
+            U32 InterpolatedPixel = IMBilinearInterpolateRGBA8(Image, Vec2F32(NewX, NewY));
+            U32 *PixelLocation = (U32 *)(NewImage.Pixels + (x + Image->Width * y) * 4);
+            *PixelLocation = InterpolatedPixel;
+        }
+    }
+
+    return NewImage;
+}

@@ -1,0 +1,1308 @@
+/*  =======================================================================
+    File: ui_core.c
+    Date: March 6th 2024  4:33 PM
+    Creator: Quinn Van De Keere
+    =======================================================================*/
+
+global_variable ui_state *UIState = 0;
+
+ui_state *UIStateAlloc()
+{
+    arena *Arena = ArenaAlloc(Megabytes(4));
+    ui_state *State = PushStruct(Arena, ui_state);
+    State->Arena = Arena;
+    State->BuildArena = ArenaAlloc(Megabytes(4));
+
+    State->BoxTableSize = 4096;
+    State->BoxTable = PushArray(Arena, ui_box_hash_slot, State->BoxTableSize);
+    
+    return State;
+}
+
+void UIStateRelease(ui_state *State)
+{
+    ArenaRelease(State->Arena);
+}
+
+void UISelectState(ui_state *State)
+{
+    UIState = State;
+}
+
+ui_signal UISignalFromBox(ui_box *Box)
+{
+    B32 IsFocusHot = Box->Flags & UI_BOX_FLAG_FOCUS_HOT;
+    ui_signal Signal = {Box};
+
+    // Calculate possibly clipped box rectangle
+    rng2_f32 Rect = Box->Rect;
+    for(ui_box *B = Box->Parent; B; B = B->Parent)
+    {
+        if(B->Flags & UI_BOX_FLAG_CLIP)
+            Rect = Intersect2F32(Rect, B->Rect);
+    }
+
+    // Determine if we're under the context menu or not
+    B8 CtxMenuIsAncestor = 0;
+    for(ui_box *Parent = Box; Parent; Parent = Parent->Parent)
+    {
+        if(Parent == UIState->CtxMenuRoot)
+        {
+            CtxMenuIsAncestor = 1;
+            break;
+        }
+    }
+
+    // Calculate blacklist rectangles
+    rng2_f32 BlacklistRect = {0};
+    if(!CtxMenuIsAncestor && UIState->CtxMenuOpen)
+        BlacklistRect = UIState->CtxMenuRoot->Rect;
+
+    B8 ViewScrolled = 0;
+    for(os_event *Event = UIState->Events->First; Event; Event = Event->Next)
+    {
+        B8 Taken = 0;
+        
+        if(Event->Window != UIState->Window) continue;
+
+        vec2_f32 EventMouse = Event->Position;
+        ui_mouse_button_kind EventMouseButtonKind = (Event->Key == OS_KEY_LEFT_MOUSE_BUTTON ? UI_MOUSE_BUTTON_KIND_LEFT :
+                                                     Event->Key == OS_KEY_MIDDLE_MOUSE_BUTTON ? UI_MOUSE_BUTTON_KIND_MIDDLE :
+                                                     Event->Key == OS_KEY_RIGHT_MOUSE_BUTTON ? UI_MOUSE_BUTTON_KIND_RIGHT :
+                                                     UI_MOUSE_BUTTON_KIND_LEFT);
+        B8 EventMouseInBounds = !Contains2F32(BlacklistRect, EventMouse) && Contains2F32(Rect, EventMouse);
+        B8 EventKeyIsMouse = (Event->Key == OS_KEY_LEFT_MOUSE_BUTTON ||
+                              Event->Key == OS_KEY_MIDDLE_MOUSE_BUTTON ||
+                              Event->Key == OS_KEY_RIGHT_MOUSE_BUTTON);
+
+        // Mouse presses in box -> set hot/active; mark signal accordingly.
+        if(Box->Flags & UI_BOX_FLAG_CLICKABLE &&
+           Event->Kind == OS_EVENT_KIND_PRESS &&
+           EventMouseInBounds &&
+           EventKeyIsMouse)
+        {
+            Signal.Flags |= (UI_SIGNAL_FLAGS_LEFT_PRESSED << EventMouseButtonKind);
+            UIState->HotBoxKey = Box->Key;
+            UIState->ActiveBoxKey[EventMouseButtonKind] = Box->Key;
+            UIState->DragStartMouse = Event->Position;
+            UIState->DragClickOffset = UIState->CurrentClickOffset;
+            UIState->CurrentClickOffset = Vec4F32(0.0f, 0.0f, 0.0f, 0.0f);
+            Taken = 1;
+        }
+
+        // Mouse releases in active box -> unset active; mark signal accordingly.
+        if(Box->Flags & UI_BOX_FLAG_CLICKABLE &&
+           Event->Kind == OS_EVENT_KIND_RELEASE &&
+           UIState->ActiveBoxKey[EventMouseButtonKind] == Box->Key &&
+           EventMouseInBounds &&
+           EventKeyIsMouse)
+        {
+            UIState->ActiveBoxKey[EventMouseButtonKind] = 0;
+            Signal.Flags |= (UI_SIGNAL_FLAGS_LEFT_RELEASED << EventMouseButtonKind);
+            Signal.Flags |= (UI_SIGNAL_FLAGS_LEFT_CLICKED << EventMouseButtonKind);
+            Taken = 1;
+        }
+
+        // Mouse releases outside active box -> unset hot/active
+        if(Box->Flags & UI_BOX_FLAG_CLICKABLE &&
+           Event->Kind == OS_EVENT_KIND_RELEASE &&
+           UIState->ActiveBoxKey[EventMouseButtonKind] == Box->Key &&
+           !EventMouseInBounds &&
+           EventKeyIsMouse)
+        {
+            UIState->HotBoxKey = 0;
+            UIState->ActiveBoxKey[EventMouseButtonKind] = 0;
+            Signal.Flags |= (UI_SIGNAL_FLAGS_LEFT_RELEASED << EventMouseButtonKind);
+            Taken = 1;
+        }
+
+        // Scrolling
+        if(Box->Flags & UI_BOX_FLAG_SCROLL &&
+           Event->Kind & OS_EVENT_KIND_SCROLL &&
+           ((Event->Flags & OS_EVENT_FLAG_CTRL) == 0) &&
+           EventMouseInBounds)
+        {
+            vec2_f32 Delta = Event->Delta;
+            if(Event->Flags & OS_EVENT_FLAG_SHIFT)
+                Swap(F32, Delta.X, Delta.Y);
+
+            vec2_i16 Delta16 = Vec2I16((I16)(Delta.X / 30.0f), (I16)(Delta.Y / 30.0f));
+            if(Delta.X > 0.0f && Delta16.X == 0) Delta16.X = 1;
+            if(Delta.X < 0.0f && Delta16.X == 0) Delta16.X = -1;
+            if(Delta.Y > 0.0f && Delta16.Y == 0) Delta16.Y = 1;
+            if(Delta.Y < 0.0f && Delta16.Y == 0) Delta16.Y = -1;
+            Signal.Scroll.X += Delta16.X;
+            Signal.Scroll.Y += Delta16.Y;
+            Taken = 1;
+        }
+
+        // View Scrolling
+        if(Box->Flags & UI_BOX_FLAG_VIEW_SCROLL && Box->FirstTouchedBuildIndex != Box->LastTouchedBuildIndex &&
+           Event->Kind == OS_EVENT_KIND_SCROLL &&
+           ((Event->Flags & OS_EVENT_FLAG_CTRL) == 0) &&
+           EventMouseInBounds)
+        {
+            vec2_f32 Delta = Event->Delta;
+            if(Event->Flags & OS_EVENT_FLAG_SHIFT)
+                Swap(F32, Delta.X, Delta.Y);
+
+            if((Box->Flags & UI_BOX_FLAG_VIEW_SCROLL_X) == 0)
+            {
+                if(Delta.Y == 0)
+                    Delta.Y = Delta.X;
+                Delta.X = 0;
+            }
+            
+            if((Box->Flags & UI_BOX_FLAG_VIEW_SCROLL_Y) == 0)
+            {
+                if(Delta.X == 0)
+                    Delta.X = Delta.Y;
+                Delta.Y = 0;
+            }
+
+            Box->ViewOffsetTarget.X += Delta.X;
+            Box->ViewOffsetTarget.Y += Delta.Y;
+            ViewScrolled = 1;
+            Taken = 1;
+        }
+
+        if(Taken)
+            OSEatEvent(UIState->Events, Event);
+    }
+
+    // Clamp View Scrolling
+    if(ViewScrolled && Box->Flags & UI_BOX_FLAG_VIEW_CLAMP)
+    {
+        vec2_f32 MaxViewOffsetTarget =
+        {
+            ClampBot(0, Box->ViewBounds.X - Box->FixedSize.X),
+            ClampBot(0, Box->ViewBounds.Y - Box->FixedSize.Y)
+        };
+        if(Box->Flags & UI_BOX_FLAG_VIEW_CLAMP_X) Box->ViewOffsetTarget.X = Clamp(0, Box->ViewOffsetTarget.X, MaxViewOffsetTarget.X);
+        if(Box->Flags & UI_BOX_FLAG_VIEW_CLAMP_Y) Box->ViewOffsetTarget.Y = Clamp(0, Box->ViewOffsetTarget.Y, MaxViewOffsetTarget.Y);
+    }
+    
+    if(Contains2F32(Rect, UIState->Mouse) && !Contains2F32(BlacklistRect, UIState->Mouse))
+        Signal.Flags |= UI_SIGNAL_FLAGS_MOUSE_OVER;
+
+    if(Box->Flags & UI_BOX_FLAG_CLICKABLE &&
+       Contains2F32(Rect, UIState->Mouse) &&
+       !Contains2F32(BlacklistRect, UIState->Mouse) &&
+       ((UIState->HotBoxKey == 0) || (UIState->HotBoxKey == Box->Key)) &&
+       ((UIState->ActiveBoxKey[UI_MOUSE_BUTTON_KIND_LEFT] == 0) || (UIState->ActiveBoxKey[UI_MOUSE_BUTTON_KIND_LEFT] == Box->Key)) &&
+       ((UIState->ActiveBoxKey[UI_MOUSE_BUTTON_KIND_MIDDLE] == 0) || (UIState->ActiveBoxKey[UI_MOUSE_BUTTON_KIND_MIDDLE] == Box->Key)) &&
+       ((UIState->ActiveBoxKey[UI_MOUSE_BUTTON_KIND_RIGHT] == 0) || (UIState->ActiveBoxKey[UI_MOUSE_BUTTON_KIND_RIGHT] == Box->Key)))
+    {
+        UIState->HotBoxKey = Box->Key;
+        Signal.Flags |= UI_SIGNAL_FLAGS_HOVERING;
+    }
+
+    if(Box->Flags & UI_BOX_FLAG_DROP_SITE &&
+       Contains2F32(Rect, UIState->Mouse) &&
+       !Contains2F32(BlacklistRect, UIState->Mouse) &&
+       (UIState->DropHotBoxKey == 0 || UIState->DropHotBoxKey == Box->Key))
+    {
+        UIState->DropHotBoxKey = Box->Key;
+    }
+
+    if(Box->Flags & UI_BOX_FLAG_DROP_SITE &&
+       (!Contains2F32(Rect, UIState->Mouse) ||
+        Contains2F32(BlacklistRect, UIState->Mouse)) &&
+       UIState->DropHotBoxKey == Box->Key)
+    {
+        UIState->DropHotBoxKey = 0;
+    }
+    
+    // active -> dragging
+    if(Box->Flags & UI_BOX_FLAG_CLICKABLE)
+    {
+        for(U32 MouseButton = 0; MouseButton < UI_MOUSE_BUTTON_KIND_COUNT; ++MouseButton)
+        {
+            if((UIState->ActiveBoxKey[MouseButton] == Box->Key) ||
+               Signal.Flags & (UI_SIGNAL_FLAGS_LEFT_PRESSED << MouseButton))
+            {
+                Signal.Flags |= (UI_SIGNAL_FLAGS_LEFT_DRAGGING << MouseButton);
+            }
+        }
+    }
+
+    if(!CtxMenuIsAncestor && Signal.Flags & (UI_SIGNAL_FLAGS_LEFT_PRESSED | UI_SIGNAL_FLAGS_RIGHT_PRESSED | UI_SIGNAL_FLAGS_MIDDLE_PRESSED))
+        UICtxMenuClose();
+
+    return Signal;
+}
+
+ui_box_rec UIGetBoxRecursionPost(ui_box *Box)
+{
+    ui_box_rec Result = {0};
+    if(Box->Last)
+    {
+        Result.Next = Box->Last;
+        ++Result.PushCount;
+    }
+    else
+    {
+        for(ui_box *Parent = Box; Parent; Parent = Parent->Parent, ++Result.PopCount)
+        {
+            if(Parent->Prev)
+            {
+                Result.Next = Parent->Prev;
+                break;
+            }
+        }
+    }
+    return Result;
+}
+
+void UICalcSizesStandaloneInPlaceRec(ui_box *Root, axis2 Axis)
+{
+    switch(Root->PrefSize[Axis].Kind)
+    {
+        case UI_SIZE_KIND_PIXELS:
+        {
+            Root->FixedSize.V[Axis] = Root->PrefSize[Axis].Value;
+        }break;
+        
+        case UI_SIZE_KIND_TEXT_CONTENT:
+        {
+            F32 Padding = Root->PrefSize[Axis].Value;
+            F32 TextSize = Root->StringRun.Dimensions.X;
+            Root->FixedSize.V[Axis] = Padding + TextSize;
+        }break;
+    }
+
+    for(ui_box *Child = Root->First; Child; Child = Child->Next)
+    {
+        UICalcSizesStandaloneInPlaceRec(Child, Axis);
+    }
+}
+
+void UICalcSizesUpwardsDependentInPlaceRec(ui_box *Root, axis2 Axis)
+{    
+    switch(Root->PrefSize[Axis].Kind)
+    {
+        case UI_SIZE_KIND_PARENT_PCT:
+        {
+            ui_box *FixedParent = 0;
+            for(ui_box *Parent = Root->Parent; Parent; Parent = Parent->Parent)
+            {        
+                if(Parent->Flags & (UI_BOX_FLAG_FIXED_WIDTH << Axis) ||
+                   Parent->PrefSize[Axis].Kind == UI_SIZE_KIND_PIXELS ||
+                   Parent->PrefSize[Axis].Kind == UI_SIZE_KIND_TEXT_CONTENT ||
+                   Parent->PrefSize[Axis].Kind == UI_SIZE_KIND_PARENT_PCT)
+                {
+                    FixedParent = Parent;
+                    break;
+                }                
+            }
+
+            F32 Size = FixedParent->FixedSize.V[Axis] * Root->PrefSize[Axis].Value;
+            Root->FixedSize.V[Axis] = Size;
+        }break;
+    }
+    
+    for(ui_box *Child = Root->First; Child; Child = Child->Next)
+    {
+        UICalcSizesUpwardsDependentInPlaceRec(Child, Axis);
+    }
+}
+
+void UICalcSizesDownwardsDependentInPlaceRec(ui_box *Root, axis2 Axis)
+{
+    for(ui_box *Child = Root->First; Child; Child = Child->Next)
+    {
+        UICalcSizesDownwardsDependentInPlaceRec(Child, Axis);
+    }
+
+    switch(Root->PrefSize[Axis].Kind)
+    {
+        case UI_SIZE_KIND_CHILDREN_SUM:
+        {
+            F32 Sum = 0.0f;
+            for(ui_box *Child = Root->First; Child; Child = Child->Next)
+            {
+                if(!(Child->Flags & (UI_BOX_FLAG_FLOATING_X << Axis)))
+                {
+                    if(Axis == Root->ChildLayoutAxis)
+                        Sum += Child->FixedSize.V[Axis];
+                    else
+                        Sum = Max(Sum, Child->FixedSize.V[Axis]);
+                }
+            }
+
+            Root->FixedSize.V[Axis] = Sum;
+        }break;
+    }
+}
+
+void UILayoutEnforceConstraintsInPlaceRec(ui_box *Root, axis2 Axis)
+{
+    temp_arena Scratch = GetScratch(0, 0);
+
+    // Fixup children sizes if we're solving along the non-layout axis
+    if(Axis != Root->ChildLayoutAxis && !(Root->Flags & (UI_BOX_FLAG_ALLOW_OVERFLOW_X << Axis)))
+    {
+        F32 AllowedSize = Root->FixedSize.V[Axis];
+        for(ui_box *Child = Root->First; Child; Child = Child->Next)
+        {
+            if(!(Child->Flags & (UI_BOX_FLAG_FLOATING_X << Axis)))
+            {
+                F32 ChildSize = Child->FixedSize.V[Axis];
+                F32 Violation = ChildSize - AllowedSize;
+                F32 MaxFixup = ChildSize;
+                F32 Fixup = Clamp(0, Violation, MaxFixup);
+                if(Fixup > 0.0f)
+                    Child->FixedSize.V[Axis] -= Fixup;
+            }
+        }
+    }
+
+    // Fixup children sizes in the direction of the layout axis
+    if(Axis == Root->ChildLayoutAxis && !(Root->Flags & (UI_BOX_FLAG_ALLOW_OVERFLOW_X << Axis)))
+    {
+        // Figure out the total allowed size and total size
+        F32 TotalAllowedSize = Root->FixedSize.V[Axis];
+        F32 TotalSize = 0.0f;
+        F32 TotalWeightedSize = 0.0f;
+        for(ui_box *Child = Root->First; Child; Child = Child->Next)
+        {
+            if(!(Child->Flags & (UI_BOX_FLAG_FLOATING_X << Axis)))
+            {
+                TotalSize += Child->FixedSize.V[Axis];
+                TotalWeightedSize += Child->FixedSize.V[Axis] * (1.0f - Child->PrefSize[Axis].Strictness);
+            }
+        }
+
+        // If we have a violation, we need to subtract some amount from all children
+        F32 Violation = TotalSize - TotalAllowedSize;
+        if(Violation > 0.0f)
+        {
+            // Figure out how much we can take in totality
+            F32 ChildFixupSum = 0.0f;
+            F32 *ChildFixups = PushArray(Scratch.Arena, F32, Root->ChildCount);
+            U64 ChildIndex = 0;
+            for(ui_box *Child = Root->First; Child; Child = Child->Next, ++ChildIndex)
+            {
+                if(!(Child->Flags & (UI_BOX_FLAG_FLOATING_X << Axis)))
+                {
+                    F32 FixupSizeThisChild = Child->FixedSize.V[Axis] * (1.0f - Child->PrefSize[Axis].Strictness);
+                    FixupSizeThisChild = ClampBot(0.0f, FixupSizeThisChild);
+                    ChildFixups[ChildIndex] = FixupSizeThisChild;
+                    ChildFixupSum += FixupSizeThisChild;
+                }
+            }
+
+            // Fixup child sizes
+            ChildIndex = 0;
+            for(ui_box *Child = Root->First; Child; Child = Child->Next, ++ChildIndex)
+            {
+                if(!(Child->Flags & (UI_BOX_FLAG_FLOATING_X << Axis)))
+                {
+                    F32 FixupPct = (Violation / TotalWeightedSize);
+                    FixupPct = Clamp(0.0f, FixupPct, 1.0f);
+                    Child->FixedSize.V[Axis] -= ChildFixups[ChildIndex] * FixupPct;
+                }
+            }
+        }
+    }
+
+    // Fixup upwards-relative sizes
+    if(Root->Flags & (UI_BOX_FLAG_ALLOW_OVERFLOW_X << Axis))
+    {
+        for(ui_box *Child = Root->First; Child; Child = Child->Next)
+        {
+            if(Child->PrefSize[Axis].Kind == UI_SIZE_KIND_PARENT_PCT)
+            {
+                Child->FixedSize.V[Axis] = Root->FixedSize.V[Axis] * Child->PrefSize[Axis].Value;
+            }
+        }
+    }
+
+    for(ui_box *Child = Root->First; Child; Child = Child->Next)
+    {
+        UILayoutEnforceConstraintsInPlaceRec(Child, Axis);
+    }
+    
+    ReleaseScratch(Scratch);
+}
+
+void UILayoutPositionInPlaceRec(ui_box *Root, axis2 Axis)
+{
+    F32 LayoutPosition = 0.0f;
+    
+    F32 Bounds = 0.0f;
+    for(ui_box *Child = Root->First; Child; Child = Child->Next)
+    {
+        F32 OriginalPosition = Min(Child->Rect.TopLeft.V[Axis], Child->Rect.BottomRight.V[Axis]);
+
+        if(!(Child->Flags & (UI_BOX_FLAG_FLOATING_X << Axis)))
+        {
+            Child->FixedPosition.V[Axis] = LayoutPosition;
+            if(Root->ChildLayoutAxis == Axis)
+            {
+                LayoutPosition += Child->FixedSize.V[Axis];
+                Bounds += Child->FixedSize.V[Axis];
+            }
+            else
+                Bounds = Max(Bounds, Child->FixedSize.V[Axis]);
+        }
+
+        if(Child->Flags & (UI_BOX_FLAG_ANIMATE_POS_X << Axis))
+        {
+            if(Child->FirstTouchedBuildIndex == Child->LastTouchedBuildIndex)
+                Child->FixedPositionAnimated = Child->FixedPosition;
+            Child->Rect.TopLeft.V[Axis] = Root->Rect.TopLeft.V[Axis] + Child->FixedPositionAnimated.V[Axis] - Root->ViewOffset.V[Axis];
+        }
+        else
+            Child->Rect.TopLeft.V[Axis] = Root->Rect.TopLeft.V[Axis] + Child->FixedPosition.V[Axis] - Root->ViewOffset.V[Axis];
+
+        Child->Rect.BottomRight.V[Axis] = Child->Rect.TopLeft.V[Axis] + Child->FixedSize.V[Axis];
+        Child->Rect.TopLeft.X = FloorF32(Child->Rect.TopLeft.X);
+        Child->Rect.TopLeft.Y = FloorF32(Child->Rect.TopLeft.Y);
+        Child->Rect.BottomRight.X = FloorF32(Child->Rect.BottomRight.X);
+        Child->Rect.BottomRight.Y = FloorF32(Child->Rect.BottomRight.Y);
+
+        F32 NewPosition = Min(Child->Rect.TopLeft.V[Axis], Child->Rect.BottomRight.V[Axis]);
+    }
+
+    Root->ViewBounds.V[Axis] = Bounds;
+
+    for(ui_box *Child = Root->First; Child; Child = Child->Next)
+    {
+        UILayoutPositionInPlaceRec(Child, Axis);
+    }
+}
+
+void UILayoutRoot(ui_box *Root, axis2 Axis)
+{
+    UICalcSizesStandaloneInPlaceRec(Root, Axis);
+    UICalcSizesUpwardsDependentInPlaceRec(Root, Axis);
+    UICalcSizesDownwardsDependentInPlaceRec(Root, Axis);
+    UILayoutEnforceConstraintsInPlaceRec(Root, Axis);
+    UILayoutPositionInPlaceRec(Root, Axis);
+}
+
+void UIBeginBuild(os_event_list *Events, os_handle Window, font_handle IconFont, F32 AnimationDelta)
+{
+    // Reset the rest of per-build ui state
+    UIState->Root = 0;
+    ArenaClear(UIState->BuildArena);
+
+    UIClearStacks
+
+    UIState->Events = Events;
+    UIState->Window = Window;
+    UIState->AnimationDelta = AnimationDelta;
+    UIState->Mouse = OSWindowIsFocused(Window) ? OSMouseFromWindow(Window) : Vec2F32(-100.0f, -100.0f);
+    UIState->TooltipOpen = 0;
+    UIState->IsAnimating = 0;
+    UIState->CtxMenuTouchedThisFrame = 0;
+    UIState->CtxMenuChanged = 0;
+
+    UIState->IconFont = IconFont;
+    
+    // Build top-level root
+    rng2_f32 ClientRect = OSClientRectFromWindow(Window);
+    vec2_f32 ClientSize = Dim2F32(ClientRect);
+    UISetNextFixedWidth(ClientSize.X);
+    UISetNextFixedHeight(ClientSize.Y);
+    UISetNextChildLayoutAxis(AXIS2_X);
+    ui_box *Root = UIMakeBoxFromStringFmt(0, Str8Lit("###%llu"), Window);
+    UIPushParent(Root);
+    UIState->Root = Root;
+
+    // Setup parent box for tooltip
+    UIFixedX(UIState->Mouse.X + 15.0f)
+        UIFixedY(UIState->Mouse.Y + 15.0f)
+        UIPrefWidth(UIChildrenSum(1.0f))
+        UIPrefHeight(UIChildrenSum(1.0f))
+    {
+        UISetNextChildLayoutAxis(AXIS2_Y);
+        UIState->TooltipRoot = UIMakeBoxFromStringFmt(0, Str8Lit("###Tooltip_%ull"), Window);
+    }
+
+    UIState->CtxMenuOpen = UIState->NextCtxMenuOpen;
+    UIState->CtxMenuAnchorKey = UIState->NextCtxMenuAnchorKey;
+    {
+        ui_box *AnchorBox = UIGetBoxFromKey(UIState->CtxMenuAnchorKey);
+        if(AnchorBox)
+            UIState->CtxMenuAnchorBoxLastPos = AnchorBox->Rect.TopLeft;
+        vec2_f32 Anchor = Add2F32(UIState->CtxMenuAnchorBoxLastPos, UIState->CtxMenuAnchorOff);
+        UIFixedX(Anchor.X) UIFixedY(Anchor.Y) UIPrefWidth(UIChildrenSum(1.0f)) UIPrefHeight(UIChildrenSum(1.0f))
+        {
+            UISetNextChildLayoutAxis(AXIS2_Y);
+            UIState->CtxMenuRoot = UIMakeBoxFromStringFmt(UI_BOX_FLAG_CLICKABLE, Str8Lit("###CtxMenu_%ull"), Window);
+        }
+    }
+
+    UIState->DropHotBoxKey = 0;
+    
+    // Reset hot if there is no active widget
+    B8 HasActive = 0;
+    for(U32 MouseButton = 0; MouseButton < UI_MOUSE_BUTTON_KIND_COUNT; ++MouseButton)
+    {
+        if(UIState->ActiveBoxKey[MouseButton])
+        {
+            HasActive = 1;
+            break;
+        }
+    }
+    if(!HasActive)
+        UIState->HotBoxKey = 0;
+
+    // Reset active keys if they have been pruned
+    for(U32 MouseButton = 0; MouseButton < UI_MOUSE_BUTTON_KIND_COUNT; ++MouseButton)
+    {
+        ui_box *Box = UIGetBoxFromKey(UIState->ActiveBoxKey[MouseButton]);
+        if(Box == 0)
+            UIState->ActiveBoxKey[MouseButton] = 0;
+    }
+
+    // Reset active keys if there is clicking activity on other windows
+    for(os_event *Event = Events->First; Event; Event = Event->Next)
+    {
+        if((Event->Kind == OS_EVENT_KIND_PRESS || Event->Kind == OS_EVENT_KIND_RELEASE) && Event->Window != Window)
+        {
+            for(U32 MouseButton = 0; MouseButton < UI_MOUSE_BUTTON_KIND_COUNT; ++MouseButton)
+                UIState->ActiveBoxKey[MouseButton] = 0;
+            break;
+        }
+    }
+}
+
+void UIEndBuild()
+{
+    // TODO: Close context menu when ESC is pressed?
+    
+    // Prune dead boxes
+    for(U64 SlotIndex = 0; SlotIndex < UIState->BoxTableSize; ++SlotIndex)
+    {
+        for(ui_box *Box = UIState->BoxTable[SlotIndex].First, *Next = 0; Box; Box = Next)
+        {
+            Next = Box->HashNext;
+            if(Box->LastTouchedBuildIndex < UIState->BuildIndex || Box->Key == 0)
+            {
+                DLLRemove_NP(UIState->BoxTable[SlotIndex].First, UIState->BoxTable[SlotIndex].Last, Box, HashNext, HashPrev);
+                DLLPushBack(UIState->FirstFreeBox, UIState->LastFreeBox, Box);
+            }
+        }
+    }
+
+    // UI layout box tree
+    for(U32 Axis = 0; Axis < AXIS2_COUNT; ++Axis)
+    {
+        UILayoutRoot(UIState->Root, Axis);
+    }
+
+    // Close context menu if untouched
+    if(!UIState->CtxMenuTouchedThisFrame)
+        UICtxMenuClose();
+
+    // Stick context menu to anchor
+    if(UIState->CtxMenuTouchedThisFrame && !UIState->CtxMenuChanged)
+    {
+        ui_box *AnchorBox = UIGetBoxFromKey(UIState->CtxMenuAnchorKey);
+        if(AnchorBox)
+        {
+            rng2_f32 RootRect = UIState->CtxMenuRoot->Rect;
+            vec2_f32 Position =
+                {
+                    AnchorBox->Rect.Left + UIState->CtxMenuAnchorOff.X,
+                    AnchorBox->Rect.Top + UIState->CtxMenuAnchorOff.Y,
+                };
+            vec2_f32 Shift = Sub2F32(Position, RootRect.TopLeft);
+            rng2_f32 NewRootRect = Shift2F32(RootRect, Shift);
+            UIState->CtxMenuRoot->FixedPosition = NewRootRect.TopLeft;
+            UIState->CtxMenuRoot->FixedSize = Dim2F32(NewRootRect);
+            UIState->CtxMenuRoot->Rect = NewRootRect;
+        }
+    }
+
+    // Ensure special floating roots are within screen bounds
+    ui_box *FloatingRoots[] = {UIState->TooltipRoot, UIState->CtxMenuRoot};
+    B8 ForceContain[] = {0, 1};
+    for(U64 Index = 0; Index < ArrayCount(FloatingRoots); ++Index)
+    {
+        ui_box *Root = FloatingRoots[Index];
+        if(Root)
+        {
+            rng2_f32 WindowRect = OSClientRectFromWindow(UIState->Window);
+            rng2_f32 RootRect = Root->Rect;
+            vec2_f32 RootRectDim = Dim2F32(RootRect);
+            vec2_f32 Shift =
+                {
+                    -ClampBot(0.0f, RootRect.Right - WindowRect.Right) * (RootRectDim.X < Root->FontSize * 15.0f || ForceContain[Index]),
+                    -ClampBot(0.0f, RootRect.Bottom - WindowRect.Bottom) * (RootRectDim.Y < Root->FontSize * 15.0f || ForceContain[Index]),
+                };
+            rng2_f32 NewRootRect = Shift2F32(RootRect, Shift);
+            Root->FixedPosition = NewRootRect.TopLeft;
+            Root->FixedSize = Dim2F32(NewRootRect);
+            Root->Rect = NewRootRect;
+            for(U32 Axis = 0; Axis < AXIS2_COUNT; ++Axis)
+            {
+                UICalcSizesStandaloneInPlaceRec(Root, Axis);
+                UICalcSizesUpwardsDependentInPlaceRec(Root, Axis);
+                UICalcSizesDownwardsDependentInPlaceRec(Root, Axis);
+                UILayoutEnforceConstraintsInPlaceRec(Root, Axis);
+                UILayoutPositionInPlaceRec(Root, Axis);
+            }
+        }
+    }
+
+    // Animate
+    {
+        F32 VastRate = 1.0f - PowF32(2.0f, (-75.0f * UIState->AnimationDelta));
+        F32 FastRate = 1.0f - PowF32(2.0f, (-50.0f * UIState->AnimationDelta));
+        F32 SlowRate = 1.0f - PowF32(2.0f, (-30.0f * UIState->AnimationDelta));
+        F32 SlugRate = 1.0f - PowF32(2.0f, (-15.0f * UIState->AnimationDelta));
+        F32 SlothRate = 1.0f - PowF32(2.0f, (-5.0f * UIState->AnimationDelta));
+
+        UIState->CtxMenuOpenT += ((F32)(UIState->CtxMenuOpen != 0) - UIState->CtxMenuOpenT) * VastRate;
+        UIState->IsAnimating = (UIState->IsAnimating || AbsF32((F32)(UIState->CtxMenuOpen != 0) - UIState->CtxMenuOpenT) > 0.01f);
+        if(UIState->CtxMenuOpenT >= 0.99f && UIState->CtxMenuOpen)
+            UIState->CtxMenuOpenT = 1.0f;
+        
+        UIState->TooltipOpenT += ((F32)(UIState->TooltipOpen != 0) - UIState->TooltipOpenT) * VastRate;
+        UIState->IsAnimating = (UIState->IsAnimating || AbsF32((F32)(UIState->TooltipOpen != 0) - UIState->TooltipOpenT) > 0.01f);
+        
+        if(UIState->TooltipOpenT >= 0.99f && UIState->TooltipOpen)
+            UIState->TooltipOpenT = 1.0f;
+        
+        for(U64 SlotIndex = 0; SlotIndex < UIState->BoxTableSize; ++SlotIndex)
+        {
+            for(ui_box *Box = UIState->BoxTable[SlotIndex].First; Box; Box = Box->HashNext)
+            {
+                // Grab states informing animation
+                B32 IsHot = Box->Key == UIState->HotBoxKey;
+                B32 IsActive = Box->Key == UIState->ActiveBoxKey[UI_MOUSE_BUTTON_KIND_LEFT];
+
+                // Determine rates
+                F32 HotRate = FastRate;
+                F32 ActiveRate = FastRate;
+
+                // Determine animating status
+                B8 BoxIsAnimating = 0;
+                BoxIsAnimating = (BoxIsAnimating || AbsF32((F32)IsHot - Box->HotT) > 0.01f);
+                BoxIsAnimating = (BoxIsAnimating || AbsF32((F32)IsActive - Box->ActiveT) > 0.01f);
+                BoxIsAnimating = (BoxIsAnimating || AbsF32((F32)Box->ViewOffsetTarget.X - Box->ViewOffset.X) > 0.5f);
+                BoxIsAnimating = (BoxIsAnimating || AbsF32((F32)Box->ViewOffsetTarget.Y - Box->ViewOffset.Y) > 0.5f);
+                if(Box->Flags & UI_BOX_FLAG_ANIMATE_POS_X)
+                    BoxIsAnimating  = (BoxIsAnimating || AbsF32(Box->FixedPositionAnimated.X - Box->FixedPosition.X) > 0.5f);
+                if(Box->Flags & UI_BOX_FLAG_ANIMATE_POS_Y)
+                    BoxIsAnimating = (BoxIsAnimating || AbsF32(Box->FixedPositionAnimated.Y - Box->FixedPosition.Y) > 0.5f);
+                UIState->IsAnimating = UIState->IsAnimating || BoxIsAnimating;
+
+                // Animate interaction transition states
+                Box->HotT += HotRate * ((F32)IsHot - Box->HotT);
+                Box->ActiveT += ActiveRate * ((F32)IsActive - Box->ActiveT);
+
+                // Animate positions
+                {
+                    Box->FixedPositionAnimated.X += FastRate * (Box->FixedPosition.X - Box->FixedPositionAnimated.X);
+                    Box->FixedPositionAnimated.Y += FastRate * (Box->FixedPosition.Y - Box->FixedPositionAnimated.Y);
+                    if(AbsF32(Box->FixedPosition.X - Box->FixedPositionAnimated.X) < 1.0f)
+                        Box->FixedPositionAnimated.X = Box->FixedPosition.X;
+                    if(AbsF32(Box->FixedPosition.Y - Box->FixedPositionAnimated.Y) < 1.0f)
+                        Box->FixedPositionAnimated.Y = Box->FixedPosition.Y;
+                }
+
+                if(Box->Flags & UI_BOX_FLAG_VIEW_CLAMP)
+                {
+                    vec2_f32 MaxViewOffsetTarget = Vec2F32(ClampBot(0.0f, Box->ViewBounds.X - Box->FixedSize.X),
+                                                           ClampBot(0.0f, Box->ViewBounds.Y - Box->FixedSize.Y));
+                    if(Box->Flags & UI_BOX_FLAG_VIEW_CLAMP_X)
+                        Box->ViewOffsetTarget.X = Clamp(0.0f, Box->ViewOffsetTarget.X, MaxViewOffsetTarget.X);
+                    if(Box->Flags & UI_BOX_FLAG_VIEW_CLAMP_Y)
+                        Box->ViewOffsetTarget.Y = Clamp(0.0f, Box->ViewOffsetTarget.Y, MaxViewOffsetTarget.Y);
+                }
+                
+                // Animate view offset
+                {
+                    Box->ViewOffset.X += FastRate * (Box->ViewOffsetTarget.X - Box->ViewOffset.X);
+                    Box->ViewOffset.Y += FastRate * (Box->ViewOffsetTarget.Y - Box->ViewOffset.Y);
+                    if(AbsF32(Box->ViewOffset.X - Box->ViewOffsetTarget.X) < 2.0f)
+                        Box->ViewOffset.X = Box->ViewOffsetTarget.X;
+                    if(AbsF32(Box->ViewOffset.Y - Box->ViewOffsetTarget.Y) < 2.0f)
+                        Box->ViewOffset.Y = Box->ViewOffsetTarget.Y;
+                }
+            }
+        }
+    }
+
+    // Animate context menu
+    if(UIState->CtxMenuOpen && UIState->CtxMenuRoot && !UIState->CtxMenuChanged)
+    {
+        ui_box *Root = UIState->CtxMenuRoot;
+        rng2_f32 Rect = Root->Rect;
+        Root->Rect.Bottom = Root->Rect.Top + Dim2F32(Rect).Y * UIState->CtxMenuOpenT;
+    }
+
+    // Fall-through interact with context menu
+    if(UIState->CtxMenuOpen)
+        UISignalFromBox(UIState->CtxMenuRoot);
+
+    // Close context menu if unconsumed clicks
+    for(os_event *Event = UIState->Events->First; Event; Event = Event->Next)
+    {
+        if(Event->Kind == OS_EVENT_KIND_PRESS && Event->Window == UIState->Window &&
+           (Event->Key == OS_KEY_LEFT_MOUSE_BUTTON || Event->Key == OS_KEY_RIGHT_MOUSE_BUTTON))
+        {
+            UICtxMenuClose();
+        }
+    }
+    
+    {
+        ui_box *Hot = UIGetBoxFromKey(UIState->HotBoxKey);
+        ui_box *Active = UIGetBoxFromKey(UIState->ActiveBoxKey[0]);
+        ui_box *Box = Active ? Active : Hot;
+        if(Box)
+        {
+            os_cursor Cursor = Box->HoverCursor;
+            OSSetCursor(Cursor); // TODO: On window focus
+        }
+        else
+            OSSetCursor(OS_CURSOR_POINTER);
+    }
+
+    ++UIState->BuildIndex;
+}
+
+ui_box *UIGetBoxFromKey(ui_key Key)
+{
+    ui_box *Box = 0;
+    if(Key)
+    {
+        U64 Slot = Key % UIState->BoxTableSize;
+        for(ui_box *BoxTest = UIState->BoxTable[Slot].First; BoxTest; BoxTest = BoxTest->HashNext)
+        {
+            if(BoxTest->Key == Key)
+            {
+                Box = BoxTest;
+                break;
+            }
+        }
+    }
+    return Box;
+}
+
+ui_key UIActiveSeedKey()
+{
+    ui_key Result =  0;
+    for(ui_box *Parent = UITopParent(); Parent; Parent = Parent->Parent)
+    {
+        if(Parent->Key)
+        {
+            Result = Parent->Key;
+            break;
+        }
+    }
+    return Result;
+}
+
+ui_box *UIMakeBoxFromKey(ui_box_flags Flags, ui_key Key)
+{
+    ui_box *Parent = UIState->ParentStack.Top != &NilParentNode ? UITopParent() : 0;
+
+    ui_box *Box = UIGetBoxFromKey(Key);
+    B8 BoxFirstFrame = Box == 0;
+
+    B8 BoxIsTransient = Key == 0;
+    
+    // Allocate box if it doesn't exist
+    if(BoxFirstFrame)
+    {
+        Box = !BoxIsTransient ? UIState->FirstFreeBox : 0;
+        if(Box)
+        {
+            DLLRemove(UIState->FirstFreeBox, UIState->LastFreeBox, Box);
+            MemoryZero(Box, sizeof(ui_box));
+        }
+        else
+            Box = PushStruct(BoxIsTransient ? UIState->BuildArena : UIState->Arena, ui_box);
+
+        // Add to hash table
+        if(!BoxIsTransient)
+        {
+            U64 Slot = Key % UIState->BoxTableSize;
+            DLLPushBack_NP(UIState->BoxTable[Slot].First, UIState->BoxTable[Slot].Last, Box, HashNext, HashPrev);
+        }
+    }
+    
+    // Zero out per frame state
+    Box->Next        = 0;
+    Box->Prev        = 0;
+    Box->First       = 0;
+    Box->Last        = 0;
+    Box->Parent      = 0;
+    Box->ChildCount  = 0;
+    Box->Flags       = 0;
+    Box->RndBucket   = 0;
+    Box->HoverCursor = OS_CURSOR_POINTER;
+    MemoryZero(Box->PrefSize, sizeof(Box->PrefSize));
+
+    Box->LastTouchedBuildIndex = UIState->BuildIndex;
+    
+    if(Parent)
+    {
+        Box->Parent = Parent;
+        DLLPushBack(Parent->First, Parent->Last, Box);
+        ++Parent->ChildCount;
+    }
+
+    // Fill the box
+    Box->Flags = Flags | UIState->FlagsStack.Top->Data;
+    Box->Key = Key;
+
+    if(BoxFirstFrame)
+        Box->FirstTouchedBuildIndex = UIState->BuildIndex;
+
+    if(UIState->FixedXStack.Top != &NilFixedXNode)
+    {
+        Box->Flags |= UI_BOX_FLAG_FLOATING_X;
+        Box->FixedPosition.X = UITopFixedX();
+    }
+    if(UIState->FixedYStack.Top != &NilFixedYNode)
+    {
+        Box->Flags |= UI_BOX_FLAG_FLOATING_Y;
+        Box->FixedPosition.Y = UITopFixedY();
+    }
+    if(UIState->FixedWidthStack.Top != &NilFixedWidthNode)
+    {
+        Box->Flags |= UI_BOX_FLAG_FIXED_WIDTH;
+        Box->FixedSize.X = UITopFixedWidth();
+    }
+    else
+    {
+        Box->PrefSize[AXIS2_X] = UITopPrefWidth();
+    }
+    if(UIState->FixedHeightStack.Top != &NilFixedHeightNode)
+    {
+        Box->Flags |= UI_BOX_FLAG_FIXED_HEIGHT;
+        Box->FixedSize.Y = UITopFixedHeight();
+    }
+    else
+    {
+        Box->PrefSize[AXIS2_Y] = UITopPrefHeight();
+    }
+
+    Box->ChildLayoutAxis = UITopChildLayoutAxis();
+    Box->BackgroundColor = UITopBackgroundColor();
+    Box->BorderColor = UITopBorderColor();
+    Box->OverlayColor = UITopOverlayColor();
+    Box->TextAlign = UITopTextAlignment();
+    Box->Font = UITopFont();
+    Box->FontSize = UITopFontSize();
+    Box->TextPadding = UITopTextPadding();
+    Box->TextColor = UITopTextColor();
+    Box->HoverCursor = UITopHoverCursor();
+    Box->CornerRadii[0] = UITopCornerRadius0();
+    Box->CornerRadii[1] = UITopCornerRadius1();
+    Box->CornerRadii[2] = UITopCornerRadius2();
+    Box->CornerRadii[3] = UITopCornerRadius3();
+    Box->Squish = UITopSquish();
+
+    UIAutoPopStacks
+    
+    return Box;
+}
+
+ui_box *UIMakeBoxFromStringFmt(ui_box_flags Flags, string8 String, ...)
+{
+    temp_arena Scratch = GetScratch(0, 0);
+
+    va_list Args;
+    va_start(Args, String);
+    string8 FormattedString = PushStr8FmtV(Scratch.Arena, String, Args);
+    va_end(Args);
+
+    ui_box *Box = UIMakeBoxFromString(Flags, FormattedString);
+    
+    ReleaseScratch(Scratch);
+
+    return Box;
+}
+
+ui_key UIKeyFromStringFmt(ui_key Seed, string8 String, ...)
+{
+    temp_arena Scratch = GetScratch(0, 0);
+
+    va_list Args;
+    va_start(Args, String);
+    string8 FormattedString = PushStr8FmtV(Scratch.Arena, String, Args);
+    va_end(Args);
+
+    ui_key Key = UIKeyFromString(Seed, FormattedString);
+    
+    ReleaseScratch(Scratch);
+
+    return Key;
+}
+
+string8 UIDisplayPartFromKeyString(string8 String)
+{
+    U64 HashPos = Str8FindNeedle(String, 0, Str8Lit("##"), 0);
+    String.Size = HashPos;
+    return String;
+}
+
+void UIBoxEquipRndBucket(ui_box *Box, rnd_bucket *Bucket)
+{
+    Box->Flags |= UI_BOX_FLAG_DRAW_BUCKET;
+    if(Box->RndBucket)
+        RndBucketScope(Box->RndBucket) RndSubBucket(Bucket);
+    else
+        Box->RndBucket = Bucket;
+}
+
+string8 UIBoxDisplayString(ui_box *Box)
+{
+    string8 Result = Box->String;
+    Result = UIDisplayPartFromKeyString(Result);
+    return Result;
+}
+
+void UIBoxEquipDisplayString(ui_box *Box, string8 String)
+{
+    Box->String = PushStr8Copy(UIState->BuildArena, String);
+    string8 DisplayString = UIBoxDisplayString(Box);
+
+    rnd_fancy_string_node FancyStringNode = {0, 0, {Box->Font, Box->FontSize, DisplayString, Box->TextColor}};
+    rnd_fancy_string_list FancyStrings = {&FancyStringNode, &FancyStringNode};
+    Box->StringRun = RndFancyRunListFromFancyStringList(UIState->BuildArena, &FancyStrings);
+}
+
+string8 UIHashPartFromString(string8 String)
+{
+    string8 Result = String;
+
+    U64 HashReplaceSignifierPos = Str8FindNeedle(String, 0, Str8Lit("###"), 0);
+    if(HashReplaceSignifierPos < String.Size)
+        Result = Str8Skip(String, HashReplaceSignifierPos);
+    
+    return Result;
+}
+
+ui_key UIKeyFromString(ui_key Seed, string8 String)
+{
+    ui_key Result = 0;
+    if(String.Size != 0)
+    {
+        Result = ++Seed;
+        string8 HashPart = UIHashPartFromString(String);
+        Result *= HashData(HashPart.String, HashPart.Size);
+    }
+    return Result;
+}
+
+ui_box *UIMakeBoxFromString(ui_box_flags Flags, string8 String)
+{
+    ui_key Key = UIKeyFromString(UIActiveSeedKey(), String);
+    ui_box *Box = UIMakeBoxFromKey(Flags, Key);
+
+    if(Flags & UI_BOX_FLAG_DRAW_TEXT)
+    {
+        UIBoxEquipDisplayString(Box, String);
+    }
+    
+    return Box;
+}
+
+ui_box *UIGetBoxRootFromState(ui_state *State)
+{
+    return State->Root;
+}
+
+vec2_f32 UIBoxTextPosition(ui_box *Box)
+{
+    vec2_f32 Result = {0};
+    font_handle Font = Box->Font;
+    F32 FontSize = Box->FontSize;
+    font_metrics FontMetrics = FontMetricsFromFontSize(Font, FontSize);
+    Result.Y = CeilF32((Box->Rect.Top + Box->Rect.Bottom) / 2.0f + (FontMetrics.CapHeight / 2) - FontMetrics.LineGap / 2);
+
+    switch(Box->TextAlign)
+    {
+        default:
+        case UI_TEXT_ALIGNMENT_TYPE_LEFT:
+        {
+            Result.X = Box->Rect.Left + Box->TextPadding;
+        }break;
+
+        case UI_TEXT_ALIGNMENT_TYPE_CENTER:
+        {
+            vec2_f32 Advance = Box->StringRun.Dimensions;
+            Result.X = (Box->Rect.Left + Box->Rect.Right) / 2 - Advance.X / 2;
+            Result.X = ClampBot(Result.X, Box->Rect.Left);
+        }break;
+
+        case UI_TEXT_ALIGNMENT_TYPE_RIGHT:
+        {
+            vec2_f32 Advance = Box->StringRun.Dimensions;
+            Result.X = (Box->Rect.Right) - 1.0f - Advance.X;
+            Result.X = ClampBot(Result.X, Box->Rect.Left);
+        }break;
+    }
+
+    Result.X = FloorF32(Result.X);
+    return Result;
+}
+
+void UITooltipBeginBase()
+{
+    UIState->TooltipOpen = 1;
+    UIPushParent(UIGetBoxRootFromState(UIState));
+    UIPushParent(UIState->TooltipRoot);
+    UIPushFlags(0);
+}
+
+void UITooltipEndBase()
+{
+    UIPopFlags();
+    UIPopParent();
+    UIPopParent();
+}
+
+void UITooltipBegin()
+{
+    UITooltipBeginBase();
+    UISetNextSquish(0.25f - UIState->TooltipOpenT * 0.25f);
+    UIFlags(UI_BOX_FLAG_DRAW_BORDER | UI_BOX_FLAG_DRAW_BACKGROUND)
+        UIPrefWidth(UIChildrenSum(1.0f))
+        UIPrefHeight(UIChildrenSum(1.0f))
+        UICornerRadius(UITopFontSize() * 0.25f)
+        UIColumnBegin();
+    UIPrefWidth(UIPX(0.0f, 1.0f)) UISpacer(UIEM(0.5f, 1.0f));
+    UIPrefWidth(UIChildrenSum(1.0f))
+        UIPrefHeight(UIChildrenSum(1.0f))
+        UIRowBegin();
+    UIPrefHeight(UIPX(0.0f, 1.0f)) UISpacer(UIEM(0.5f, 1.0f));
+    UIPrefWidth(UIChildrenSum(1.0f))
+        UIPrefHeight(UIChildrenSum(1.0f))
+        UIColumnBegin();
+    UIPushPrefWidth(UITextDim(10.0f, 1.0f));
+    UIPushPrefHeight(UIEM(2.0f, 1.0f));
+    UIPushTextAlignment(UI_TEXT_ALIGNMENT_TYPE_CENTER);
+}
+
+void UITooltipEnd()
+{
+    UIPopTextAlignment();
+    UIPopPrefWidth();
+    UIPopPrefHeight();
+    UIColumnEnd();
+    UIPrefHeight(UIPX(0.0f, 1.0f)) UISpacer(UIEM(0.5f, 1.0f));
+    UIRowEnd();
+    UIPrefWidth(UIPX(0.0f, 1.0f)) UISpacer(UIEM(0.5f, 1.0f));
+    UIColumnEnd();
+    UITooltipEndBase();
+}
+
+void UICtxMenuOpen(ui_key Key, ui_key AnchorBoxKey, vec2_f32 AnchorOff)
+{
+    AnchorOff.X = (F32)(I32)AnchorOff.X;
+    AnchorOff.Y = (F32)(I32)AnchorOff.Y;
+    UIState->NextCtxMenuOpen = 1;
+    UIState->CtxMenuChanged = 1;
+    UIState->CtxMenuOpenT = 0.0f;
+    UIState->CtxMenuKey = Key;
+    UIState->NextCtxMenuAnchorKey = AnchorBoxKey;
+    UIState->CtxMenuAnchorOff = AnchorOff;
+    UIState->CtxMenuTouchedThisFrame = 1;
+    UIState->CtxMenuAnchorBoxLastPos = Vec2F32(0.0f, 0.0f);
+}
+
+void UICtxMenuClose()
+{
+    UIState->NextCtxMenuOpen = 0;
+}
+
+B8 UIBeginCtxMenu(ui_key Key)
+{
+    UIPushParent(UIGetBoxRootFromState(UIState));
+    UIPushParent(UIState->CtxMenuRoot);
+    B8 Result = (Key == UIState->CtxMenuKey) && UIState->CtxMenuOpen;
+    if(Result)
+    {
+        UIState->CtxMenuTouchedThisFrame = 1;
+        UIState->CtxMenuRoot->Flags |= UI_BOX_FLAG_ROUND_CHILD_BY_PARENT;
+        UIState->CtxMenuRoot->Flags |= UI_BOX_FLAG_DRAW_BACKGROUND;
+        UIState->CtxMenuRoot->Flags |= UI_BOX_FLAG_DRAW_BORDER;
+        UIState->CtxMenuRoot->Flags |= UI_BOX_FLAG_CLIP;
+        UIState->CtxMenuRoot->Flags |= UI_BOX_FLAG_CLICKABLE;
+        UIState->CtxMenuRoot->Flags |= UI_BOX_FLAG_DRAW_BORDER_FOCUS;
+        UIState->CtxMenuRoot->CornerRadii[0] = UIState->CtxMenuRoot->CornerRadii[1] = 
+            UIState->CtxMenuRoot->CornerRadii[2] = UIState->CtxMenuRoot->CornerRadii[3] = UITopFontSize() * 0.25f;
+        UIState->CtxMenuRoot->BackgroundColor = UITopBackgroundColor();
+        UIState->CtxMenuRoot->BorderColor = UITopBorderColor();
+    }
+    UIPushPrefWidth(UITopPrefWidth());
+    UIPushPrefHeight(UITopPrefHeight());
+    return Result;
+}
+
+void UIEndCtxMenu()
+{
+    UIPopPrefWidth();
+    UIPopPrefHeight();
+    UIPopParent();
+    UIPopParent();
+}
+
+B8 UICtxMenuIsOpen(ui_key Key)
+{
+    return UIState->CtxMenuOpen && (Key == UIState->CtxMenuKey);
+}
+
+B8 UIAnyCtxMenuIsOpen()
+{
+    return UIState->CtxMenuOpen;
+}
+
+vec2_f32 UIMouse()
+{
+    return UIState->Mouse;
+}
+
+vec2_f32 UIDragDelta()
+{
+    return Sub2F32(UIMouse(), UIState->DragStartMouse);
+}
+
+os_event_list *UIEvents()
+{
+    return UIState->Events;
+}
+
+void UISetNextClickOffset(vec4_f32 Offset)
+{
+    UIState->CurrentClickOffset = Offset;
+}
+
+void UISetClickOffset(vec4_f32 Offset)
+{
+    UIState->DragClickOffset = Offset;
+}
+
+vec4_f32 UIDragClickOffset()
+{
+    return UIState->DragClickOffset;
+}
+
+ui_key UIDropHotKey()
+{
+    return UIState->DropHotBoxKey;
+}
+
+void UIPushCornerRadius(F32 Rad)
+{
+    UIPushCornerRadius0(Rad);
+    UIPushCornerRadius1(Rad);
+    UIPushCornerRadius2(Rad);
+    UIPushCornerRadius3(Rad);
+}
+
+void UIPopCornerRadius()
+{
+    UIPopCornerRadius0();
+    UIPopCornerRadius1();
+    UIPopCornerRadius2();
+    UIPopCornerRadius3();
+}
+
+void UIPushRect(rng2_f32 Rect)
+{
+    vec2_f32 Size = Dim2F32(Rect);
+    UIPushFixedX(Rect.Left);
+    UIPushFixedY(Rect.Top);
+    UIPushFixedWidth(Size.X);
+    UIPushFixedHeight(Size.Y);
+}
+
+void UIPopRect()
+{
+    UIPopFixedX();
+    UIPopFixedY();
+    UIPopFixedWidth();
+    UIPopFixedHeight();
+}
+
+void UIPushPrefSize(axis2 Axis, ui_size Size)
+{
+    if(Axis == AXIS2_X) UIPushPrefWidth(Size);
+    else UIPushPrefHeight(Size);
+}
+
+void UIPopPrefSize(axis2 Axis)
+{
+    if(Axis == AXIS2_X) UIPopPrefWidth();
+    else UIPopPrefHeight();
+}
+
+void UISetNextPrefSize(axis2 Axis, ui_size Size)
+{
+    if(Axis == AXIS2_X) UISetNextPrefWidth(Size);
+    else UISetNextPrefHeight(Size);
+}
+
+ui_size UISize(ui_size_kind Kind, F32 Value, F32 Strictness)
+{
+    ui_size Size = {0};
+    Size.Kind = Kind;
+    Size.Value = Value;
+    Size.Strictness = Strictness;
+    return Size;
+}
+
+font_handle UIIconFont()
+{
+    return UIState->IconFont;
+}
+
+ui_scroll_pt UIScrollPt(I64 Index, F32 Offset)
+{
+    ui_scroll_pt Pt = {0};
+    Pt.Index = Index;
+    Pt.Offset = Offset;
+    return Pt;
+}
+
+void UIScrollPtTargetIndex(ui_scroll_pt *Pt, I64 Index)
+{
+    Pt->Offset = ModF32(Pt->Offset, 1.0f) + (F32)(Pt->Index + (I64)Pt->Offset - Index);
+    if(Pt->Offset != Pt->Index * -1.0f)
+        Log("Break!\n");
+    Pt->Index = Index;
+}
+
+void UIScrollPtClampIndex(ui_scroll_pt *Pt, vec2_i64 Range)
+{
+    if(Pt->Index < Range.X || Range.Y < Pt->Index)
+    {
+        I64 Clamped = Range.X;
+        UIScrollPtTargetIndex(Pt, Clamped);
+    }
+}
+
+#define UIStackPushImpl(State, Stack, StackName, Element)   \
+    {                                                       \
+        Stack *Node = PushStruct(State->BuildArena, Stack); \
+        Node->Data = Element;                               \
+        SLLStackPush(State->StackName.Top, Node);           \
+        State->StackName.AutoPop = 0;                       \
+    }
+
+#define UIStackPopImpl(State, StackName)        \
+    {                                           \
+        SLLStackPop(State->StackName.Top);      \
+        State->StackName.AutoPop = 0;           \
+    }
+
+#define UIStackSetNextImpl(State, Stack, StackName, Element)    \
+    {                                                           \
+        Stack *Node = PushStruct(State->BuildArena, Stack);     \
+        Node->Data = Element;                                   \
+        SLLStackPush(State->StackName.Top, Node);               \
+        State->StackName.AutoPop = 1;                           \
+    }
+
+#include "generated/ui.meta.c"
